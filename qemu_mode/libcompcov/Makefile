@@ -1,10 +1,10 @@
 #
-# american fuzzy lop - libcompcov
+# american fuzzy lop++ - libcompcov
 # --------------------------------
 #
 # Written by Andrea Fioraldi <andreafioraldi@gmail.com>
 #
-# Copyright 2019 Andrea Fioraldi. All rights reserved.
+# Copyright 2019-2020 Andrea Fioraldi. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
 
 PREFIX      ?= /usr/local
 HELPER_PATH  = $(PREFIX)/lib/afl
+DOC_PATH    ?= $(PREFIX)/share/doc/afl
+MAN_PATH    ?= $(PREFIX)/man/man8
 
 VERSION     = $(shell grep '^\#define VERSION ' ../config.h | cut -d '"' -f2)
 
@@ -22,7 +24,7 @@ CFLAGS      ?= -O3 -funroll-loops -I ../../include/
 CFLAGS      += -Wall -Wno-unused-result -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign
 LDFLAGS     += -ldl
 
-all: libcompcov.so compcovtest
+all: libcompcov.so
 
 libcompcov.so: libcompcov.so.c ../../config.h
 	$(CC) $(CFLAGS) -shared -fPIC $< -o ../../$@ $(LDFLAGS)
@@ -34,9 +36,9 @@ clean:
 	rm -f ../../libcompcov.so compcovtest
 
 compcovtest:	compcovtest.cc
-	$(CXX) $< -o $@ 
+	$(CXX) -std=c++11 $< -o $@ 
 
 install: all
 	install -m 755 ../../libcompcov.so $${DESTDIR}$(HELPER_PATH)
-	install -m 644 README.compcov $${DESTDIR}$(HELPER_PATH)
+	install -m 644 -T README.md $${DESTDIR}$(DOC_PATH)/README.compcov.md
 

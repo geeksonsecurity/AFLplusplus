@@ -4,12 +4,12 @@
 
    Originally written by Michal Zalewski
 
-   Now maintained by by Marc Heuse <mh@mh-sec.de>,
+   Now maintained by Marc Heuse <mh@mh-sec.de>,
                         Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -48,8 +48,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static u8*  as_path;                   /* Path to the AFL 'as' wrapper      */
-static u8** cc_params;                 /* Parameters passed to the real CC  */
+static u8 * as_path;                   /* Path to the AFL 'as' wrapper      */
+static u8 **cc_params;                 /* Parameters passed to the real CC  */
 static u32  cc_par_cnt = 1;            /* Param count, including argv0      */
 static u8   be_quiet,                  /* Quiet mode                        */
     clang_mode;                        /* Invoked as afl-clang*?            */
@@ -57,9 +57,9 @@ static u8   be_quiet,                  /* Quiet mode                        */
 /* Try to find our "fake" GNU assembler in AFL_PATH or at the location derived
    from argv[0]. If that fails, abort. */
 
-static void find_as(u8* argv0) {
+static void find_as(u8 *argv0) {
 
-  u8* afl_path = getenv("AFL_PATH");
+  u8 *afl_path = getenv("AFL_PATH");
   u8 *slash, *tmp;
 
   if (afl_path) {
@@ -82,7 +82,7 @@ static void find_as(u8* argv0) {
 
   if (slash) {
 
-    u8* dir;
+    u8 *dir;
 
     *slash = 0;
     dir = ck_strdup(argv0);
@@ -116,22 +116,27 @@ static void find_as(u8* argv0) {
 
 /* Copy argv to cc_params, making the necessary edits. */
 
-static void edit_params(u32 argc, char** argv) {
+static void edit_params(u32 argc, char **argv) {
 
   u8  fortify_set = 0, asan_set = 0;
-  u8* name;
+  u8 *name;
 
 #if defined(__FreeBSD__) && defined(WORD_SIZE_64)
   u8 m32_set = 0;
 #endif
 
-  cc_params = ck_alloc((argc + 128) * sizeof(u8*));
+  cc_params = ck_alloc((argc + 128) * sizeof(u8 *));
 
   name = strrchr(argv[0], '/');
-  if (!name)
+  if (!name) {
+
     name = argv[0];
-  else
+
+  } else {
+
     ++name;
+
+  }
 
   if (!strncmp(name, "afl-clang", 9)) {
 
@@ -141,13 +146,18 @@ static void edit_params(u32 argc, char** argv) {
 
     if (!strcmp(name, "afl-clang++")) {
 
-      u8* alt_cxx = getenv("AFL_CXX");
-      cc_params[0] = alt_cxx ? alt_cxx : (u8*)"clang++";
+      u8 *alt_cxx = getenv("AFL_CXX");
+      cc_params[0] = alt_cxx && *alt_cxx ? alt_cxx : (u8 *)"clang++";
+
+    } else if (!strcmp(name, "afl-clang")) {
+
+      u8 *alt_cc = getenv("AFL_CC");
+      cc_params[0] = alt_cc && *alt_cc ? alt_cc : (u8 *)"clang";
 
     } else {
 
-      u8* alt_cc = getenv("AFL_CC");
-      cc_params[0] = alt_cc ? alt_cc : (u8*)"clang";
+      fprintf(stderr, "Name of the binary: %s\n", argv[0]);
+      FATAL("Name of the binary is not a known name, expected afl-clang(++)");
 
     }
 
@@ -161,12 +171,24 @@ static void edit_params(u32 argc, char** argv) {
 
 #ifdef __APPLE__
 
-    if (!strcmp(name, "afl-g++"))
+    if (!strcmp(name, "afl-g++")) {
+
       cc_params[0] = getenv("AFL_CXX");
-    else if (!strcmp(name, "afl-gcj"))
+
+    } else if (!strcmp(name, "afl-gcj")) {
+
       cc_params[0] = getenv("AFL_GCJ");
-    else
+
+    } else if (!strcmp(name, "afl-gcc")) {
+
       cc_params[0] = getenv("AFL_CC");
+
+    } else {
+
+      fprintf(stderr, "Name of the binary: %s\n", argv[0]);
+      FATAL("Name of the binary is not a known name, expected afl-gcc/g++/gcj");
+
+    }
 
     if (!cc_params[0]) {
 
@@ -186,18 +208,23 @@ static void edit_params(u32 argc, char** argv) {
 
     if (!strcmp(name, "afl-g++")) {
 
-      u8* alt_cxx = getenv("AFL_CXX");
-      cc_params[0] = alt_cxx ? alt_cxx : (u8*)"g++";
+      u8 *alt_cxx = getenv("AFL_CXX");
+      cc_params[0] = alt_cxx && *alt_cxx ? alt_cxx : (u8 *)"g++";
 
     } else if (!strcmp(name, "afl-gcj")) {
 
-      u8* alt_cc = getenv("AFL_GCJ");
-      cc_params[0] = alt_cc ? alt_cc : (u8*)"gcj";
+      u8 *alt_cc = getenv("AFL_GCJ");
+      cc_params[0] = alt_cc && *alt_cc ? alt_cc : (u8 *)"gcj";
+
+    } else if (!strcmp(name, "afl-gcc")) {
+
+      u8 *alt_cc = getenv("AFL_CC");
+      cc_params[0] = alt_cc && *alt_cc ? alt_cc : (u8 *)"gcc";
 
     } else {
 
-      u8* alt_cc = getenv("AFL_CC");
-      cc_params[0] = alt_cc ? alt_cc : (u8*)"gcc";
+      fprintf(stderr, "Name of the binary: %s\n", argv[0]);
+      FATAL("Name of the binary is not a known name, expected afl-gcc/g++/gcj");
 
     }
 
@@ -207,11 +234,11 @@ static void edit_params(u32 argc, char** argv) {
 
   while (--argc) {
 
-    u8* cur = *(++argv);
+    u8 *cur = *(++argv);
 
     if (!strncmp(cur, "-B", 2)) {
 
-      if (!be_quiet) WARNF("-B is already set, overriding");
+      if (!be_quiet) { WARNF("-B is already set, overriding"); }
 
       if (!cur[2] && argc > 1) {
 
@@ -224,18 +251,22 @@ static void edit_params(u32 argc, char** argv) {
 
     }
 
-    if (!strcmp(cur, "-integrated-as")) continue;
+    if (!strcmp(cur, "-integrated-as")) { continue; }
 
-    if (!strcmp(cur, "-pipe")) continue;
+    if (!strcmp(cur, "-pipe")) { continue; }
 
 #if defined(__FreeBSD__) && defined(WORD_SIZE_64)
     if (!strcmp(cur, "-m32")) m32_set = 1;
 #endif
 
-    if (!strcmp(cur, "-fsanitize=address") || !strcmp(cur, "-fsanitize=memory"))
+    if (!strcmp(cur, "-fsanitize=address") ||
+        !strcmp(cur, "-fsanitize=memory")) {
+
       asan_set = 1;
 
-    if (strstr(cur, "FORTIFY_SOURCE")) fortify_set = 1;
+    }
+
+    if (strstr(cur, "FORTIFY_SOURCE")) { fortify_set = 1; }
 
     cc_params[cc_par_cnt++] = cur;
 
@@ -244,13 +275,13 @@ static void edit_params(u32 argc, char** argv) {
   cc_params[cc_par_cnt++] = "-B";
   cc_params[cc_par_cnt++] = as_path;
 
-  if (clang_mode) cc_params[cc_par_cnt++] = "-no-integrated-as";
+  if (clang_mode) { cc_params[cc_par_cnt++] = "-no-integrated-as"; }
 
   if (getenv("AFL_HARDEN")) {
 
     cc_params[cc_par_cnt++] = "-fstack-protector-all";
 
-    if (!fortify_set) cc_params[cc_par_cnt++] = "-D_FORTIFY_SOURCE=2";
+    if (!fortify_set) { cc_params[cc_par_cnt++] = "-D_FORTIFY_SOURCE=2"; }
 
   }
 
@@ -262,23 +293,45 @@ static void edit_params(u32 argc, char** argv) {
 
   } else if (getenv("AFL_USE_ASAN")) {
 
-    if (getenv("AFL_USE_MSAN")) FATAL("ASAN and MSAN are mutually exclusive");
+    if (getenv("AFL_USE_MSAN")) {
 
-    if (getenv("AFL_HARDEN"))
+      FATAL("ASAN and MSAN are mutually exclusive");
+
+    }
+
+    if (getenv("AFL_HARDEN")) {
+
       FATAL("ASAN and AFL_HARDEN are mutually exclusive");
+
+    }
 
     cc_params[cc_par_cnt++] = "-U_FORTIFY_SOURCE";
     cc_params[cc_par_cnt++] = "-fsanitize=address";
 
   } else if (getenv("AFL_USE_MSAN")) {
 
-    if (getenv("AFL_USE_ASAN")) FATAL("ASAN and MSAN are mutually exclusive");
+    if (getenv("AFL_USE_ASAN")) {
 
-    if (getenv("AFL_HARDEN"))
+      FATAL("ASAN and MSAN are mutually exclusive");
+
+    }
+
+    if (getenv("AFL_HARDEN")) {
+
       FATAL("MSAN and AFL_HARDEN are mutually exclusive");
+
+    }
 
     cc_params[cc_par_cnt++] = "-U_FORTIFY_SOURCE";
     cc_params[cc_par_cnt++] = "-fsanitize=memory";
+
+  }
+
+  if (getenv("AFL_USE_UBSAN")) {
+
+    cc_params[cc_par_cnt++] = "-fsanitize=undefined";
+    cc_params[cc_par_cnt++] = "-fsanitize-undefined-trap-on-error";
+    cc_params[cc_par_cnt++] = "-fno-sanitize-recover=all";
 
   }
 
@@ -332,13 +385,38 @@ static void edit_params(u32 argc, char** argv) {
 
 /* Main entry point */
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
+
+  char *env_info =
+      "Environment variables used by afl-gcc:\n"
+      "AFL_CC: path to the C compiler to use\n"
+      "AFL_CXX: path to the C++ compiler to use\n"
+      "AFL_GCJ: path to the java compiler to use\n"
+      "AFL_PATH: path to the instrumenting assembler\n"
+      "AFL_DONT_OPTIMIZE: disable optimization instead of -O3\n"
+      "AFL_NO_BUILTIN: compile for use with libtokencap.so\n"
+      "AFL_QUIET: suppress verbose output\n"
+      "AFL_CAL_FAST: speed up the initial calibration\n"
+      "AFL_HARDEN: adds code hardening to catch memory bugs\n"
+      "AFL_USE_ASAN: activate address sanitizer\n"
+      "AFL_USE_MSAN: activate memory sanitizer\n"
+      "AFL_USE_UBSAN: activate undefined behaviour sanitizer\n"
+
+      "\nEnvironment variables used by afl-as (called by afl-gcc):\n"
+      "AFL_AS: path to the assembler to use\n"
+      "TMPDIR: set the directory for temporary files of afl-as\n"
+      "TEMP: fall back path to directory for temporary files\n"
+      "TMP: fall back path to directory for temporary files\n"
+      "AFL_INST_RATIO: percentage of branches to instrument\n"
+      "AFL_QUIET: suppress verbose output\n"
+      "AFL_KEEP_ASSEMBLY: leave instrumented assembly files\n"
+      "AFL_AS_FORCE_INSTRUMENT: force instrumentation for asm sources\n";
 
   if (argc == 2 && strcmp(argv[1], "-h") == 0) {
 
     printf("afl-cc" VERSION " by Michal Zalewski\n\n");
     printf("%s \n\n", argv[0]);
-    printf("afl-gcc has no command line options\n");
+    printf("afl-gcc has no command line options\n\n%s\n", env_info);
     printf(
         "NOTE: afl-gcc is deprecated, llvm_mode is much faster and has more "
         "options\n");
@@ -346,16 +424,18 @@ int main(int argc, char** argv) {
 
   }
 
-  if (isatty(2) && !getenv("AFL_QUIET")) {
+  if ((isatty(2) && !getenv("AFL_QUIET")) || getenv("AFL_DEBUG") != NULL) {
 
     SAYF(cCYA "afl-cc" VERSION cRST " by Michal Zalewski\n");
     SAYF(cYEL "[!] " cBRI "NOTE: " cRST
               "afl-gcc is deprecated, llvm_mode is much faster and has more "
               "options\n");
 
-  } else
+  } else {
 
     be_quiet = 1;
+
+  }
 
   if (argc < 2) {
 
@@ -369,15 +449,25 @@ int main(int argc, char** argv) {
         "following:\n\n"
 
         "  CC=%s/afl-gcc ./configure\n"
-        "  CXX=%s/afl-g++ ./configure\n\n"
+        "  CXX=%s/afl-g++ ./configure\n\n%s"
 
-        "You can specify custom next-stage toolchain via AFL_CC, AFL_CXX, and "
-        "AFL_AS.\n"
-        "Setting AFL_HARDEN enables hardening optimizations in the compiled "
-        "code.\n\n",
-        BIN_PATH, BIN_PATH);
+        ,
+        BIN_PATH, BIN_PATH, env_info);
 
     exit(1);
+
+  }
+
+  u8 *ptr;
+  if (!be_quiet &&
+      ((ptr = getenv("AFL_MAP_SIZE")) || (ptr = getenv("AFL_MAPSIZE")))) {
+
+    u32 map_size = atoi(ptr);
+    if (map_size != MAP_SIZE) {
+
+      FATAL("AFL_MAP_SIZE is not supported by afl-gcc");
+
+    }
 
   }
 
@@ -385,7 +475,7 @@ int main(int argc, char** argv) {
 
   edit_params(argc, argv);
 
-  execvp(cc_params[0], (char**)cc_params);
+  execvp(cc_params[0], (char **)cc_params);
 
   FATAL("Oops, failed to execute '%s' - check your PATH", cc_params[0]);
 

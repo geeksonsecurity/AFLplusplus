@@ -4,12 +4,12 @@
 
    Originally written by Michal Zalewski
 
-   Now maintained by by Marc Heuse <mh@mh-sec.de>,
+   Now maintained by Marc Heuse <mh@mh-sec.de>,
                         Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -24,40 +24,26 @@
  */
 
 #include "afl-fuzz.h"
+#include <limits.h>
 
 /* Write bitmap to file. The bitmap is useful mostly for the secret
    -B option, to focus a separate fuzzing session on a particular
    interesting input without rediscovering all the others. */
 
-void write_bitmap(void) {
+void write_bitmap(afl_state_t *afl) {
 
-  u8* fname;
+  u8  fname[PATH_MAX];
   s32 fd;
 
-  if (!bitmap_changed) return;
-  bitmap_changed = 0;
+  if (!afl->bitmap_changed) { return; }
+  afl->bitmap_changed = 0;
 
-  fname = alloc_printf("%s/fuzz_bitmap", out_dir);
+  snprintf(fname, PATH_MAX, "%s/fuzz_bitmap", afl->out_dir);
   fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 
-  if (fd < 0) PFATAL("Unable to open '%s'", fname);
+  if (fd < 0) { PFATAL("Unable to open '%s'", fname); }
 
-  ck_write(fd, virgin_bits, MAP_SIZE, fname);
-
-  close(fd);
-  ck_free(fname);
-
-}
-
-/* Read bitmap from file. This is for the -B option again. */
-
-void read_bitmap(u8* fname) {
-
-  s32 fd = open(fname, O_RDONLY);
-
-  if (fd < 0) PFATAL("Unable to open '%s'", fname);
-
-  ck_read(fd, virgin_bits, MAP_SIZE, fname);
+  ck_write(fd, afl->virgin_bits, afl->fsrv.map_size, fname);
 
   close(fd);
 
@@ -71,23 +57,25 @@ void read_bitmap(u8* fname) {
    This function is called after every exec() on a fairly large buffer, so
    it needs to be fast. We do this in 32-bit and 64-bit flavors. */
 
-u8 has_new_bits(u8* virgin_map) {
+u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 
 #ifdef WORD_SIZE_64
 
-  u64* current = (u64*)trace_bits;
-  u64* virgin = (u64*)virgin_map;
+  u64 *current = (u64 *)afl->fsrv.trace_bits;
+  u64 *virgin = (u64 *)virgin_map;
 
-  u32 i = (MAP_SIZE >> 3);
+  u32 i = (afl->fsrv.map_size >> 3);
 
 #else
 
-  u32* current = (u32*)trace_bits;
-  u32* virgin = (u32*)virgin_map;
+  u32 *current = (u32 *)afl->fsrv.trace_bits;
+  u32 *virgin = (u32 *)virgin_map;
 
-  u32 i = (MAP_SIZE >> 2);
+  u32 i = (afl->fsrv.map_size >> 2);
 
-#endif                                                       /* ^WORD_SIZE_64 */
+#endif                                                     /* ^WORD_SIZE_64 */
+  // the map size must be a minimum of 8 bytes.
+  // for variable/dynamic map sizes this is ensured in the forkserver
 
   u8 ret = 0;
 
@@ -97,35 +85,43 @@ u8 has_new_bits(u8* virgin_map) {
        that have not been already cleared from the virgin map - since this will
        almost always be the case. */
 
+    // the (*current) is unnecessary but speeds up the overall comparison
     if (unlikely(*current) && unlikely(*current & *virgin)) {
 
       if (likely(ret < 2)) {
 
-        u8* cur = (u8*)current;
-        u8* vir = (u8*)virgin;
+        u8 *cur = (u8 *)current;
+        u8 *vir = (u8 *)virgin;
 
         /* Looks like we have not found any new bytes yet; see if any non-zero
            bytes in current[] are pristine in virgin[]. */
 
 #ifdef WORD_SIZE_64
 
-        if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
-            (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff) ||
-            (cur[4] && vir[4] == 0xff) || (cur[5] && vir[5] == 0xff) ||
-            (cur[6] && vir[6] == 0xff) || (cur[7] && vir[7] == 0xff))
+        if (*virgin == 0xffffffffffffffff || (cur[0] && vir[0] == 0xff) ||
+            (cur[1] && vir[1] == 0xff) || (cur[2] && vir[2] == 0xff) ||
+            (cur[3] && vir[3] == 0xff) || (cur[4] && vir[4] == 0xff) ||
+            (cur[5] && vir[5] == 0xff) || (cur[6] && vir[6] == 0xff) ||
+            (cur[7] && vir[7] == 0xff)) {
+
           ret = 2;
-        else
+
+        } else {
+
           ret = 1;
+
+        }
 
 #else
 
-        if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
-            (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff))
+        if (*virgin == 0xffffffff || (cur[0] && vir[0] == 0xff) ||
+            (cur[1] && vir[1] == 0xff) || (cur[2] && vir[2] == 0xff) ||
+            (cur[3] && vir[3] == 0xff))
           ret = 2;
         else
           ret = 1;
 
-#endif                                                       /* ^WORD_SIZE_64 */
+#endif                                                     /* ^WORD_SIZE_64 */
 
       }
 
@@ -138,7 +134,11 @@ u8 has_new_bits(u8* virgin_map) {
 
   }
 
-  if (ret && virgin_map == virgin_bits) bitmap_changed = 1;
+  if (unlikely(ret) && likely(virgin_map == afl->virgin_bits)) {
+
+    afl->bitmap_changed = 1;
+
+  }
 
   return ret;
 
@@ -147,10 +147,10 @@ u8 has_new_bits(u8* virgin_map) {
 /* Count the number of bits set in the provided bitmap. Used for the status
    screen several times every second, does not have to be fast. */
 
-u32 count_bits(u8* mem) {
+u32 count_bits(afl_state_t *afl, u8 *mem) {
 
-  u32* ptr = (u32*)mem;
-  u32  i = (MAP_SIZE >> 2);
+  u32 *ptr = (u32 *)mem;
+  u32  i = (afl->fsrv.map_size >> 2);
   u32  ret = 0;
 
   while (i--) {
@@ -177,27 +177,25 @@ u32 count_bits(u8* mem) {
 
 }
 
-#define FF(_b) (0xff << ((_b) << 3))
-
 /* Count the number of bytes set in the bitmap. Called fairly sporadically,
    mostly to update the status screen or calibrate and examine confirmed
    new paths. */
 
-u32 count_bytes(u8* mem) {
+u32 count_bytes(afl_state_t *afl, u8 *mem) {
 
-  u32* ptr = (u32*)mem;
-  u32  i = (MAP_SIZE >> 2);
+  u32 *ptr = (u32 *)mem;
+  u32  i = (afl->fsrv.map_size >> 2);
   u32  ret = 0;
 
   while (i--) {
 
     u32 v = *(ptr++);
 
-    if (!v) continue;
-    if (v & FF(0)) ++ret;
-    if (v & FF(1)) ++ret;
-    if (v & FF(2)) ++ret;
-    if (v & FF(3)) ++ret;
+    if (!v) { continue; }
+    if (v & 0x000000ff) { ++ret; }
+    if (v & 0x0000ff00) { ++ret; }
+    if (v & 0x00ff0000) { ++ret; }
+    if (v & 0xff000000) { ++ret; }
 
   }
 
@@ -208,10 +206,10 @@ u32 count_bytes(u8* mem) {
 /* Count the number of non-255 bytes set in the bitmap. Used strictly for the
    status screen, several calls per second or so. */
 
-u32 count_non_255_bytes(u8* mem) {
+u32 count_non_255_bytes(afl_state_t *afl, u8 *mem) {
 
-  u32* ptr = (u32*)mem;
-  u32  i = (MAP_SIZE >> 2);
+  u32 *ptr = (u32 *)mem;
+  u32  i = (afl->fsrv.map_size >> 2);
   u32  ret = 0;
 
   while (i--) {
@@ -221,11 +219,11 @@ u32 count_non_255_bytes(u8* mem) {
     /* This is called on the virgin bitmap, so optimize for the most likely
        case. */
 
-    if (v == 0xffffffff) continue;
-    if ((v & FF(0)) != FF(0)) ++ret;
-    if ((v & FF(1)) != FF(1)) ++ret;
-    if ((v & FF(2)) != FF(2)) ++ret;
-    if ((v & FF(3)) != FF(3)) ++ret;
+    if (v == 0xffffffff) { continue; }
+    if ((v & 0x000000ff) != 0x000000ff) { ++ret; }
+    if ((v & 0x0000ff00) != 0x0000ff00) { ++ret; }
+    if ((v & 0x00ff0000) != 0x00ff0000) { ++ret; }
+    if ((v & 0xff000000) != 0xff000000) { ++ret; }
 
   }
 
@@ -246,9 +244,9 @@ const u8 simplify_lookup[256] = {
 
 #ifdef WORD_SIZE_64
 
-void simplify_trace(u64* mem) {
+void simplify_trace(afl_state_t *afl, u64 *mem) {
 
-  u32 i = MAP_SIZE >> 3;
+  u32 i = (afl->fsrv.map_size >> 3);
 
   while (i--) {
 
@@ -256,7 +254,7 @@ void simplify_trace(u64* mem) {
 
     if (unlikely(*mem)) {
 
-      u8* mem8 = (u8*)mem;
+      u8 *mem8 = (u8 *)mem;
 
       mem8[0] = simplify_lookup[mem8[0]];
       mem8[1] = simplify_lookup[mem8[1]];
@@ -267,9 +265,11 @@ void simplify_trace(u64* mem) {
       mem8[6] = simplify_lookup[mem8[6]];
       mem8[7] = simplify_lookup[mem8[7]];
 
-    } else
+    } else {
 
       *mem = 0x0101010101010101ULL;
+
+    }
 
     ++mem;
 
@@ -279,9 +279,9 @@ void simplify_trace(u64* mem) {
 
 #else
 
-void simplify_trace(u32* mem) {
+void simplify_trace(afl_state_t *afl, u32 *mem) {
 
-  u32 i = MAP_SIZE >> 2;
+  u32 i = (afl->fsrv.map_size >> 2);
 
   while (i--) {
 
@@ -289,7 +289,7 @@ void simplify_trace(u32* mem) {
 
     if (unlikely(*mem)) {
 
-      u8* mem8 = (u8*)mem;
+      u8 *mem8 = (u8 *)mem;
 
       mem8[0] = simplify_lookup[mem8[0]];
       mem8[1] = simplify_lookup[mem8[1]];
@@ -306,7 +306,7 @@ void simplify_trace(u32* mem) {
 
 }
 
-#endif                                                       /* ^WORD_SIZE_64 */
+#endif                                                     /* ^WORD_SIZE_64 */
 
 /* Destructively classify execution counts in a trace. This is used as a
    preprocessing step for any newly acquired traces. Called on every exec,
@@ -332,18 +332,26 @@ void init_count_class16(void) {
 
   u32 b1, b2;
 
-  for (b1 = 0; b1 < 256; b1++)
-    for (b2 = 0; b2 < 256; b2++)
+  for (b1 = 0; b1 < 256; b1++) {
+
+    for (b2 = 0; b2 < 256; b2++) {
+
       count_class_lookup16[(b1 << 8) + b2] =
           (count_class_lookup8[b1] << 8) | count_class_lookup8[b2];
+
+    }
+
+  }
 
 }
 
 #ifdef WORD_SIZE_64
 
-void classify_counts(u64* mem) {
+void classify_counts(afl_forkserver_t *fsrv) {
 
-  u32 i = MAP_SIZE >> 3;
+  u64 *mem = (u64 *)fsrv->trace_bits;
+
+  u32 i = (fsrv->map_size >> 3);
 
   while (i--) {
 
@@ -351,7 +359,7 @@ void classify_counts(u64* mem) {
 
     if (unlikely(*mem)) {
 
-      u16* mem16 = (u16*)mem;
+      u16 *mem16 = (u16 *)mem;
 
       mem16[0] = count_class_lookup16[mem16[0]];
       mem16[1] = count_class_lookup16[mem16[1]];
@@ -368,9 +376,11 @@ void classify_counts(u64* mem) {
 
 #else
 
-void classify_counts(u32* mem) {
+void classify_counts(afl_forkserver_t *fsrv) {
 
-  u32 i = MAP_SIZE >> 2;
+  u32 *mem = (u32 *)fsrv->trace_bits;
+
+  u32 i = (fsrv->map_size >> 2);
 
   while (i--) {
 
@@ -378,7 +388,7 @@ void classify_counts(u32* mem) {
 
     if (unlikely(*mem)) {
 
-      u16* mem16 = (u16*)mem;
+      u16 *mem16 = (u16 *)mem;
 
       mem16[0] = count_class_lookup16[mem16[0]];
       mem16[1] = count_class_lookup16[mem16[1]];
@@ -391,19 +401,19 @@ void classify_counts(u32* mem) {
 
 }
 
-#endif                                                       /* ^WORD_SIZE_64 */
+#endif                                                     /* ^WORD_SIZE_64 */
 
 /* Compact trace bytes into a smaller bitmap. We effectively just drop the
    count information here. This is called only sporadically, for some
    new paths. */
 
-void minimize_bits(u8* dst, u8* src) {
+void minimize_bits(afl_state_t *afl, u8 *dst, u8 *src) {
 
   u32 i = 0;
 
-  while (i < MAP_SIZE) {
+  while (i < afl->fsrv.map_size) {
 
-    if (*(src++)) dst[i >> 3] |= 1 << (i & 7);
+    if (*(src++)) { dst[i >> 3] |= 1 << (i & 7); }
     ++i;
 
   }
@@ -413,41 +423,51 @@ void minimize_bits(u8* dst, u8* src) {
 #ifndef SIMPLE_FILES
 
 /* Construct a file name for a new test case, capturing the operation
-   that led to its discovery. Uses a static buffer. */
+   that led to its discovery. Returns a ptr to afl->describe_op_buf_256. */
 
-u8* describe_op(u8 hnb) {
+u8 *describe_op(afl_state_t *afl, u8 hnb) {
 
-  static u8 ret[256];
+  u8 *ret = afl->describe_op_buf_256;
 
-  if (syncing_party) {
+  if (unlikely(afl->syncing_party)) {
 
-    sprintf(ret, "sync:%s,src:%06u", syncing_party, syncing_case);
+    sprintf(ret, "sync:%s,src:%06u", afl->syncing_party, afl->syncing_case);
 
   } else {
 
-    sprintf(ret, "src:%06u", current_entry);
+    sprintf(ret, "src:%06u", afl->current_entry);
 
-    sprintf(ret + strlen(ret), ",time:%llu", get_cur_time() - start_time);
+    if (afl->splicing_with >= 0) {
 
-    if (splicing_with >= 0) sprintf(ret + strlen(ret), "+%06d", splicing_with);
+      sprintf(ret + strlen(ret), "+%06d", afl->splicing_with);
 
-    sprintf(ret + strlen(ret), ",op:%s", stage_short);
+    }
 
-    if (stage_cur_byte >= 0) {
+    sprintf(ret + strlen(ret), ",time:%llu", get_cur_time() - afl->start_time);
 
-      sprintf(ret + strlen(ret), ",pos:%d", stage_cur_byte);
+    sprintf(ret + strlen(ret), ",op:%s", afl->stage_short);
 
-      if (stage_val_type != STAGE_VAL_NONE)
+    if (afl->stage_cur_byte >= 0) {
+
+      sprintf(ret + strlen(ret), ",pos:%d", afl->stage_cur_byte);
+
+      if (afl->stage_val_type != STAGE_VAL_NONE) {
+
         sprintf(ret + strlen(ret), ",val:%s%+d",
-                (stage_val_type == STAGE_VAL_BE) ? "be:" : "", stage_cur_val);
+                (afl->stage_val_type == STAGE_VAL_BE) ? "be:" : "",
+                afl->stage_cur_val);
 
-    } else
+      }
 
-      sprintf(ret + strlen(ret), ",rep:%d", stage_cur_val);
+    } else {
+
+      sprintf(ret + strlen(ret), ",rep:%d", afl->stage_cur_val);
+
+    }
 
   }
 
-  if (hnb == 2) strcat(ret, ",+cov");
+  if (hnb == 2) { strcat(ret, ",+cov"); }
 
   return ret;
 
@@ -457,22 +477,25 @@ u8* describe_op(u8 hnb) {
 
 /* Write a message accompanying the crash directory :-) */
 
-static void write_crash_readme(void) {
+static void write_crash_readme(afl_state_t *afl) {
 
-  u8*   fn = alloc_printf("%s/crashes/README.txt", out_dir);
+  u8    fn[PATH_MAX];
   s32   fd;
-  FILE* f;
+  FILE *f;
+
+  u8 val_buf[STRINGIFY_VAL_SIZE_MAX];
+
+  sprintf(fn, "%s/crashes/README.txt", afl->out_dir);
 
   fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
-  ck_free(fn);
 
   /* Do not die on errors here - that would be impolite. */
 
-  if (fd < 0) return;
+  if (unlikely(fd < 0)) { return; }
 
   f = fdopen(fd, "w");
 
-  if (!f) {
+  if (unlikely(!f)) {
 
     close(fd);
     return;
@@ -497,9 +520,11 @@ static void write_crash_readme(void) {
       "drop\n"
       "an mail at <afl-users@googlegroups.com> once the issues are fixed\n\n"
 
-      "  https://github.com/vanhauser-thc/AFLplusplus\n\n",
+      "  https://github.com/AFLplusplus/AFLplusplus\n\n",
 
-      orig_cmdline, DMS(mem_limit << 20));                 /* ignore errors */
+      afl->orig_cmdline,
+      stringify_mem_size(val_buf, sizeof(val_buf),
+                         afl->fsrv.mem_limit << 20));      /* ignore errors */
 
   fclose(f);
 
@@ -509,71 +534,83 @@ static void write_crash_readme(void) {
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
 
-u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
+u8 save_if_interesting(afl_state_t *afl, void *mem, u32 len, u8 fault) {
 
-  if (len == 0) return 0;
+  if (unlikely(len == 0)) { return 0; }
 
-  u8* fn = "";
-  u8  hnb;
+  u8 *queue_fn = "";
+  u8  hnb = '\0';
   s32 fd;
   u8  keeping = 0, res;
 
-  /* Update path frequency. */
-  u32 cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+  u8 fn[PATH_MAX];
 
-  struct queue_entry* q = queue;
+  /* Update path frequency. */
+  u32 cksum = hash32(afl->fsrv.trace_bits, afl->fsrv.map_size, HASH_CONST);
+
+  struct queue_entry *q = afl->queue;
   while (q) {
 
-    if (q->exec_cksum == cksum) q->n_fuzz = q->n_fuzz + 1;
+    if (q->exec_cksum == cksum) {
+
+      q->n_fuzz = q->n_fuzz + 1;
+      break;
+
+    }
 
     q = q->next;
 
   }
 
-  if (fault == crash_mode) {
+  if (unlikely(fault == afl->crash_mode)) {
 
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
 
-    if (!(hnb = has_new_bits(virgin_bits))) {
+    if (!(hnb = has_new_bits(afl, afl->virgin_bits))) {
 
-      if (crash_mode) ++total_crashes;
+      if (unlikely(afl->crash_mode)) { ++afl->total_crashes; }
       return 0;
 
     }
 
 #ifndef SIMPLE_FILES
 
-    fn = alloc_printf("%s/queue/id:%06u,%s", out_dir, queued_paths,
-                      describe_op(hnb));
+    queue_fn = alloc_printf("%s/queue/id:%06u,%s", afl->out_dir,
+                            afl->queued_paths, describe_op(afl, hnb));
 
 #else
 
-    fn = alloc_printf("%s/queue/id_%06u", out_dir, queued_paths);
+    queue_fn =
+        alloc_printf("%s/queue/id_%06u", afl->out_dir, afl->queued_paths);
 
 #endif                                                    /* ^!SIMPLE_FILES */
 
-    add_to_queue(fn, len, 0);
+    add_to_queue(afl, queue_fn, len, 0);
 
     if (hnb == 2) {
 
-      queue_top->has_new_cov = 1;
-      ++queued_with_cov;
+      afl->queue_top->has_new_cov = 1;
+      ++afl->queued_with_cov;
 
     }
 
-    queue_top->exec_cksum = cksum;
+    afl->queue_top->exec_cksum = cksum;
 
     /* Try to calibrate inline; this also calls update_bitmap_score() when
        successful. */
 
-    res = calibrate_case(argv, queue_top, mem, queue_cycle - 1, 0);
+    res = calibrate_case(afl, afl->queue_top, mem, afl->queue_cycle - 1, 0);
 
-    if (res == FAULT_ERROR) FATAL("Unable to execute target application");
+    if (unlikely(res == FSRV_RUN_ERROR)) {
 
-    fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) PFATAL("Unable to create '%s'", fn);
-    ck_write(fd, mem, len, fn);
+      FATAL("Unable to execute target application");
+
+    }
+
+    fd = open(queue_fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (unlikely(fd < 0)) { PFATAL("Unable to create '%s'", queue_fn); }
+    ck_write(fd, mem, len, queue_fn);
     close(fd);
 
     keeping = 1;
@@ -582,69 +619,74 @@ u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
   switch (fault) {
 
-    case FAULT_TMOUT:
+    case FSRV_RUN_TMOUT:
 
       /* Timeouts are not very interesting, but we're still obliged to keep
          a handful of samples. We use the presence of new bits in the
-         hang-specific bitmap as a signal of uniqueness. In "dumb" mode, we
-         just keep everything. */
+         hang-specific bitmap as a signal of uniqueness. In "non-instrumented"
+         mode, we just keep everything. */
 
-      ++total_tmouts;
+      ++afl->total_tmouts;
 
-      if (unique_hangs >= KEEP_UNIQUE_HANG) return keeping;
+      if (afl->unique_hangs >= KEEP_UNIQUE_HANG) { return keeping; }
 
-      if (!dumb_mode) {
+      if (likely(!afl->non_instrumented_mode)) {
 
 #ifdef WORD_SIZE_64
-        simplify_trace((u64*)trace_bits);
+        simplify_trace(afl, (u64 *)afl->fsrv.trace_bits);
 #else
-        simplify_trace((u32*)trace_bits);
-#endif                                                       /* ^WORD_SIZE_64 */
+        simplify_trace(afl, (u32 *)afl->fsrv.trace_bits);
+#endif                                                     /* ^WORD_SIZE_64 */
 
-        if (!has_new_bits(virgin_tmout)) return keeping;
+        if (!has_new_bits(afl, afl->virgin_tmout)) { return keeping; }
 
       }
 
-      ++unique_tmouts;
+      ++afl->unique_tmouts;
 
       /* Before saving, we make sure that it's a genuine hang by re-running
          the target with a more generous timeout (unless the default timeout
          is already generous). */
 
-      if (exec_tmout < hang_tmout) {
+      if (afl->fsrv.exec_tmout < afl->hang_tmout) {
 
         u8 new_fault;
-        write_to_testcase(mem, len);
-        new_fault = run_target(argv, hang_tmout);
+        write_to_testcase(afl, mem, len);
+        new_fault = fuzz_run_target(afl, &afl->fsrv, afl->hang_tmout);
 
         /* A corner case that one user reported bumping into: increasing the
            timeout actually uncovers a crash. Make sure we don't discard it if
            so. */
 
-        if (!stop_soon && new_fault == FAULT_CRASH) goto keep_as_crash;
+        if (!afl->stop_soon && new_fault == FSRV_RUN_CRASH) {
 
-        if (stop_soon || new_fault != FAULT_TMOUT) return keeping;
+          goto keep_as_crash;
+
+        }
+
+        if (afl->stop_soon || new_fault != FSRV_RUN_TMOUT) { return keeping; }
 
       }
 
 #ifndef SIMPLE_FILES
 
-      fn = alloc_printf("%s/hangs/id:%06llu,%s", out_dir, unique_hangs,
-                        describe_op(0));
+      snprintf(fn, PATH_MAX, "%s/hangs/id:%06llu,%s", afl->out_dir,
+               afl->unique_hangs, describe_op(afl, 0));
 
 #else
 
-      fn = alloc_printf("%s/hangs/id_%06llu", out_dir, unique_hangs);
+      snprintf(fn, PATH_MAX, "%s/hangs/id_%06llu", afl->out_dir,
+               afl->unique_hangs);
 
 #endif                                                    /* ^!SIMPLE_FILES */
 
-      ++unique_hangs;
+      ++afl->unique_hangs;
 
-      last_hang_time = get_cur_time();
+      afl->last_hang_time = get_cur_time();
 
       break;
 
-    case FAULT_CRASH:
+    case FSRV_RUN_CRASH:
 
     keep_as_crash:
 
@@ -652,52 +694,63 @@ u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
          except for slightly different limits and no need to re-run test
          cases. */
 
-      ++total_crashes;
+      ++afl->total_crashes;
 
-      if (unique_crashes >= KEEP_UNIQUE_CRASH) return keeping;
+      if (afl->unique_crashes >= KEEP_UNIQUE_CRASH) { return keeping; }
 
-      if (!dumb_mode) {
+      if (likely(!afl->non_instrumented_mode)) {
 
 #ifdef WORD_SIZE_64
-        simplify_trace((u64*)trace_bits);
+        simplify_trace(afl, (u64 *)afl->fsrv.trace_bits);
 #else
-        simplify_trace((u32*)trace_bits);
-#endif                                                       /* ^WORD_SIZE_64 */
+        simplify_trace(afl, (u32 *)afl->fsrv.trace_bits);
+#endif                                                     /* ^WORD_SIZE_64 */
 
-        if (!has_new_bits(virgin_crash)) return keeping;
+        if (!has_new_bits(afl, afl->virgin_crash)) { return keeping; }
 
       }
 
-      if (!unique_crashes) write_crash_readme();
+      if (unlikely(!afl->unique_crashes)) { write_crash_readme(afl); }
 
 #ifndef SIMPLE_FILES
 
-      fn = alloc_printf("%s/crashes/id:%06llu,sig:%02u,%s", out_dir,
-                        unique_crashes, kill_signal, describe_op(0));
+      snprintf(fn, PATH_MAX, "%s/crashes/id:%06llu,sig:%02u,%s", afl->out_dir,
+               afl->unique_crashes, afl->fsrv.last_kill_signal,
+               describe_op(afl, 0));
 
 #else
 
-      fn = alloc_printf("%s/crashes/id_%06llu_%02u", out_dir, unique_crashes,
-                        kill_signal);
+      snprintf(fn, PATH_MAX, "%s/crashes/id_%06llu_%02u", afl->out_dir,
+               afl->unique_crashes, afl->last_kill_signal);
 
 #endif                                                    /* ^!SIMPLE_FILES */
 
-      ++unique_crashes;
+      ++afl->unique_crashes;
+      if (unlikely(afl->infoexec)) {
 
-      if (infoexec)  // if the user wants to be informed on new crashes - do
-                     // that
-        if (system(infoexec) == -1)
-          hnb += 0;  // we dont care if system errors, but we dont want a
-                     // compiler warning either
+        // if the user wants to be informed on new crashes - do that
+#if !TARGET_OS_IPHONE
+        // we dont care if system errors, but we dont want a
+        // compiler warning either
+        // See
+        // https://stackoverflow.com/questions/11888594/ignoring-return-values-in-c
+        (void)(system(afl->infoexec) + 1);
+#else
+        WARNF("command execution unsupported");
+#endif
 
-      last_crash_time = get_cur_time();
-      last_crash_execs = total_execs;
+      }
+
+      afl->last_crash_time = get_cur_time();
+      afl->last_crash_execs = afl->fsrv.total_execs;
 
       break;
 
-    case FAULT_ERROR: FATAL("Unable to execute target application");
+    case FSRV_RUN_ERROR:
+      FATAL("Unable to execute target application");
 
-    default: return keeping;
+    default:
+      return keeping;
 
   }
 
@@ -705,11 +758,9 @@ u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
      test case, too. */
 
   fd = open(fn, O_WRONLY | O_CREAT | O_EXCL, 0600);
-  if (fd < 0) PFATAL("Unable to create '%s'", fn);
+  if (unlikely(fd < 0)) { PFATAL("Unable to create '%s'", fn); }
   ck_write(fd, mem, len, fn);
   close(fd);
-
-  ck_free(fn);
 
   return keeping;
 

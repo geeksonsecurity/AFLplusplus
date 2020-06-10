@@ -15,6 +15,7 @@
    Other code written by Michal Zalewski
 
    Copyright 2016 Google Inc. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -31,11 +32,11 @@
 
 #ifdef __x86_64__
 
-#define ROL64(_x, _r) ((((u64)(_x)) << (_r)) | (((u64)(_x)) >> (64 - (_r))))
+  #define ROL64(_x, _r) ((((u64)(_x)) << (_r)) | (((u64)(_x)) >> (64 - (_r))))
 
-static inline u32 hash32(const void* key, u32 len, u32 seed) {
+static inline u32 hash32(const void *key, u32 len, u32 seed) {
 
-  const u64* data = (u64*)key;
+  const u64 *data = (u64 *)key;
   u64        h1 = seed ^ len;
 
   len >>= 3;
@@ -66,11 +67,11 @@ static inline u32 hash32(const void* key, u32 len, u32 seed) {
 
 #else
 
-#define ROL32(_x, _r) ((((u32)(_x)) << (_r)) | (((u32)(_x)) >> (32 - (_r))))
+  #define ROL32(_x, _r) ((((u32)(_x)) << (_r)) | (((u32)(_x)) >> (32 - (_r))))
 
-static inline u32 hash32(const void* key, u32 len, u32 seed) {
+static inline u32 hash32(const void *key, u32 len, u32 seed) {
 
-  const u32* data = (u32*)key;
+  const u32 *data = (u32 *)key;
   u32        h1 = seed ^ len;
 
   len >>= 2;

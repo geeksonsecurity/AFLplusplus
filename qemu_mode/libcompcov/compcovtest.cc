@@ -2,7 +2,7 @@
 //
 // Author: Mateusz Jurczyk (mjurczyk@google.com)
 //
-// Copyright 2019 Google LLC
+// Copyright 2019-2020 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,9 +51,11 @@ int main() {
 
   switch (z) {
 
-    case 0xBEEF: break;
+    case 0xBEEF:
+      break;
 
-    default: return 4;
+    default:
+      return 4;
 
   }
 

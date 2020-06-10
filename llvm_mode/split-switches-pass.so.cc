@@ -18,6 +18,13 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <list>
+#include <string>
+#include <fstream>
+#include <sys/time.h>
+
+#include "llvm/Config/llvm-config.h"
+
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -26,11 +33,22 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
-#include "llvm/IR/Verifier.h"
 #include "llvm/Pass.h"
 #include "llvm/Analysis/ValueTracking.h"
 
+#include "llvm/IR/IRBuilder.h"
+#if LLVM_VERSION_MAJOR > 3 || \
+    (LLVM_VERSION_MAJOR == 3 && LLVM_VERSION_MINOR > 4)
+  #include "llvm/IR/Verifier.h"
+  #include "llvm/IR/DebugInfo.h"
+#else
+  #include "llvm/Analysis/Verifier.h"
+  #include "llvm/DebugInfo.h"
+  #define nullptr 0
+#endif
+
 #include <set>
+#include "afl-llvm-common.h"
 
 using namespace llvm;
 
@@ -41,6 +59,8 @@ class SplitSwitchesTransform : public ModulePass {
  public:
   static char ID;
   SplitSwitchesTransform() : ModulePass(ID) {
+
+    initWhitelist();
 
   }
 
@@ -71,6 +91,9 @@ class SplitSwitchesTransform : public ModulePass {
 
   typedef std::vector<CaseExpr> CaseVector;
 
+ protected:
+  int be_quiet = 0;
+
  private:
   bool        splitSwitches(Module &M);
   bool        transformCmps(Module &M, const bool processStrcmp,
@@ -96,7 +119,7 @@ BasicBlock *SplitSwitchesTransform::switchConvert(
   IntegerType *        ByteType = IntegerType::get(OrigBlock->getContext(), 8);
   unsigned             BytesInValue = bytesChecked.size();
   std::vector<uint8_t> setSizes;
-  std::vector<std::set<uint8_t>> byteSets(BytesInValue, std::set<uint8_t>());
+  std::vector<std::set<uint8_t> > byteSets(BytesInValue, std::set<uint8_t>());
 
   assert(ValTypeBitWidth >= 8 && ValTypeBitWidth <= 64);
 
@@ -169,8 +192,25 @@ BasicBlock *SplitSwitchesTransform::switchConvert(
     NewNode->getInstList().push_back(Comp);
 
     bytesChecked[smallestIndex] = true;
-    if (std::all_of(bytesChecked.begin(), bytesChecked.end(),
-                    [](bool b) { return b; })) {
+    bool allBytesAreChecked = true;
+
+    for (std::vector<bool>::iterator BCI = bytesChecked.begin(),
+                                     E = bytesChecked.end();
+         BCI != E; ++BCI) {
+
+      if (!*BCI) {
+
+        allBytesAreChecked = false;
+        break;
+
+      }
+
+    }
+
+    //    if (std::all_of(bytesChecked.begin(), bytesChecked.end(),
+    //                    [](bool b) { return b; })) {
+
+    if (allBytesAreChecked) {
 
       assert(Cases.size() == 1);
       BranchInst::Create(Cases[0].BB, NewDefault, Comp, NewNode);
@@ -262,11 +302,17 @@ BasicBlock *SplitSwitchesTransform::switchConvert(
 
 bool SplitSwitchesTransform::splitSwitches(Module &M) {
 
+#if (LLVM_VERSION_MAJOR == 3 && LLVM_VERSION_MINOR < 7)
+  LLVMContext &C = M.getContext();
+#endif
+
   std::vector<SwitchInst *> switches;
 
   /* iterate over all functions, bbs and instruction and add
    * all switches to switches vector for later processing */
   for (auto &F : M) {
+
+    if (!isInWhitelist(&F)) continue;
 
     for (auto &BB : F) {
 
@@ -284,8 +330,9 @@ bool SplitSwitchesTransform::splitSwitches(Module &M) {
   }
 
   if (!switches.size()) return false;
-  errs() << "Rewriting " << switches.size() << " switch statements "
-         << "\n";
+  if (!be_quiet)
+    errs() << "Rewriting " << switches.size() << " switch statements "
+           << "\n";
 
   for (auto &SI : switches) {
 
@@ -297,13 +344,15 @@ bool SplitSwitchesTransform::splitSwitches(Module &M) {
     BasicBlock *Default = SI->getDefaultDest();
     unsigned    bitw = Val->getType()->getIntegerBitWidth();
 
-    errs() << "switch: " << SI->getNumCases() << " cases " << bitw << " bit\n";
+    if (!be_quiet)
+      errs() << "switch: " << SI->getNumCases() << " cases " << bitw
+             << " bit\n";
 
     /* If there is only the default destination or the condition checks 8 bit or
      * less, don't bother with the code below. */
     if (!SI->getNumCases() || bitw <= 8) {
 
-      if (getenv("AFL_QUIET") == NULL) errs() << "skip trivial switch..\n";
+      if (!be_quiet) errs() << "skip trivial switch..\n";
       continue;
 
     }
@@ -313,8 +362,7 @@ bool SplitSwitchesTransform::splitSwitches(Module &M) {
      * if the default block is set as an unreachable we avoid creating one
      * because will never be a valid target.*/
     BasicBlock *NewDefault = nullptr;
-    NewDefault = BasicBlock::Create(SI->getContext(), "NewDefault");
-    NewDefault->insertInto(F, Default);
+    NewDefault = BasicBlock::Create(SI->getContext(), "NewDefault", F, Default);
     BranchInst::Create(Default, NewDefault);
 
     /* Prepare cases vector. */
@@ -369,8 +417,10 @@ bool SplitSwitchesTransform::splitSwitches(Module &M) {
 
 bool SplitSwitchesTransform::runOnModule(Module &M) {
 
-  if (getenv("AFL_QUIET") == NULL)
+  if ((isatty(2) && getenv("AFL_QUIET") == NULL) || getenv("AFL_DEBUG") != NULL)
     llvm::errs() << "Running split-switches-pass by laf.intel@gmail.com\n";
+  else
+    be_quiet = 1;
   splitSwitches(M);
   verifyModule(M);
 

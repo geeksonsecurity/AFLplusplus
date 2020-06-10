@@ -4,12 +4,13 @@
 
    Originally written by Michal Zalewski
 
-   Now maintained by by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
-                        Andrea Fioraldi <andreafioraldi@gmail.com>
+   Now maintained by Marc Heuse <mh@mh-sec.de>,
+                     Heiko Eißfeldt <heiko.eissfeldt@hexco.de>,
+                     Andrea Fioraldi <andreafioraldi@gmail.com>,
+                     Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -107,7 +108,7 @@
 
  */
 
-static const u8* trampoline_fmt_32 =
+static const u8 *trampoline_fmt_32 =
 
     "\n"
     "/* --- AFL TRAMPOLINE (32-BIT) --- */\n"
@@ -130,7 +131,7 @@ static const u8* trampoline_fmt_32 =
     "/* --- END --- */\n"
     "\n";
 
-static const u8* trampoline_fmt_64 =
+static const u8 *trampoline_fmt_64 =
 
     "\n"
     "/* --- AFL TRAMPOLINE (64-BIT) --- */\n"
@@ -151,7 +152,7 @@ static const u8* trampoline_fmt_64 =
     "/* --- END --- */\n"
     "\n";
 
-static const u8* main_payload_32 = 
+static const u8 *main_payload_32 = 
 
   "\n"
   "/* --- AFL MAIN PAYLOAD (32-BIT) --- */\n"
@@ -191,7 +192,7 @@ static const u8* main_payload_32 =
 #ifdef SKIP_COUNTS
   "  orb  $1, (%edx, %edi, 1)\n"
 #else
-  "  incb (%edx, %edi, 1)\n"
+  "  addb $1, (%edx, %edi, 1)\n"
   "  adcb $0, (%edx, %edi, 1)\n" // never zero counter implementation. slightly better path discovery and little performance impact
 #endif                                                      /* ^SKIP_COUNTS */
   "\n"
@@ -261,6 +262,7 @@ static const u8* main_payload_32 =
   "  je   __afl_setup_abort\n"
   "\n"
 #endif
+  "  movb $1, (%eax)\n"
   "  /* Store the address of the SHM region. */\n"
   "\n"
   "  movl %eax, __afl_area_ptr\n"
@@ -383,6 +385,7 @@ static const u8* main_payload_32 =
 #ifndef COVERAGE_ONLY
   "  .comm   __afl_prev_loc, 4, 32\n"
 #endif                                                    /* !COVERAGE_ONLY */
+  "  .comm   __afl_final_loc, 4, 32\n"
   "  .comm   __afl_fork_pid, 4, 32\n"
   "  .comm   __afl_temp, 4, 32\n"
   "\n"
@@ -401,12 +404,12 @@ static const u8* main_payload_32 =
    recognize .string. */
 
 #ifdef __APPLE__
-#define CALL_L64(str) "call _" str "\n"
+  #define CALL_L64(str) "call _" str "\n"
 #else
-#define CALL_L64(str) "call " str "@PLT\n"
+  #define CALL_L64(str) "call " str "@PLT\n"
 #endif                                                        /* ^__APPLE__ */
 
-static const u8* main_payload_64 = 
+static const u8 *main_payload_64 = 
 
   "\n"
   "/* --- AFL MAIN PAYLOAD (64-BIT) --- */\n"
@@ -444,7 +447,7 @@ static const u8* main_payload_64 =
 #ifdef SKIP_COUNTS
   "  orb  $1, (%rdx, %rcx, 1)\n"
 #else
-  "  incb (%rdx, %rcx, 1)\n"
+  "  addb $1, (%rdx, %rcx, 1)\n"
   "  adcb $0, (%rdx, %rcx, 1)\n" // never zero counter implementation. slightly better path discovery and little performance impact
 #endif                                                      /* ^SKIP_COUNTS */
   "\n"
@@ -563,6 +566,7 @@ static const u8* main_payload_64 =
   "  je   __afl_setup_abort\n"
   "\n"
 #endif
+  "  movb $1, (%rax)\n"
   "  /* Store the address of the SHM region. */\n"
   "\n"
   "  movq %rax, %rdx\n"
@@ -740,9 +744,9 @@ static const u8* main_payload_64 =
 #ifdef __APPLE__
 
   "  .comm   __afl_area_ptr, 8\n"
-#ifndef COVERAGE_ONLY
+  #ifndef COVERAGE_ONLY
   "  .comm   __afl_prev_loc, 8\n"
-#endif                                                    /* !COVERAGE_ONLY */
+  #endif                                                  /* !COVERAGE_ONLY */
   "  .comm   __afl_fork_pid, 4\n"
   "  .comm   __afl_temp, 4\n"
   "  .comm   __afl_setup_failure, 1\n"
@@ -750,9 +754,9 @@ static const u8* main_payload_64 =
 #else
 
   "  .lcomm   __afl_area_ptr, 8\n"
-#ifndef COVERAGE_ONLY
+  #ifndef COVERAGE_ONLY
   "  .lcomm   __afl_prev_loc, 8\n"
-#endif                                                    /* !COVERAGE_ONLY */
+  #endif                                                  /* !COVERAGE_ONLY */
   "  .lcomm   __afl_fork_pid, 4\n"
   "  .lcomm   __afl_temp, 4\n"
   "  .lcomm   __afl_setup_failure, 1\n"

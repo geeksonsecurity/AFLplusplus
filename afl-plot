@@ -1,9 +1,9 @@
 #!/bin/sh
 #
-# american fuzzy lop - Advanced Persistent Graphing
+# american fuzzy lop++ - Advanced Persistent Graphing
 # -------------------------------------------------
 #
-# Written by Michal Zalewski
+# Originally written by Michal Zalewski
 # Based on a design & prototype by Michael Rash.
 #
 # Copyright 2014, 2015 Google Inc. All rights reserved.
@@ -32,6 +32,8 @@ an empty directory where this tool can write the resulting plots to.
 The program will put index.html and three PNG images in the output directory;
 you should be able to view it with any web browser of your choice.
 
+Environment variables used:
+AFL_ALLOW_TMP: allow /var/tmp or /tmp for input and output directories
 _EOF_
 
   exit 1
@@ -66,7 +68,7 @@ BANNER="`cat "$1/fuzzer_stats" | grep '^afl_banner ' | cut -d: -f2- | cut -b2-`"
 
 test "$BANNER" = "" && BANNER="(none)"
 
-GNUPLOT=`which gnuplot 2>/dev/null`
+GNUPLOT=`command -v gnuplot 2>/dev/null`
 
 if [ "$GNUPLOT" = "" ]; then
 

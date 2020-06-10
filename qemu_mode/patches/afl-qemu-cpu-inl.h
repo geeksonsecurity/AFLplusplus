@@ -12,7 +12,7 @@
    counters by Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2015, 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -32,30 +32,15 @@
  */
 
 #include <sys/shm.h>
-#include "../../config.h"
 #include "afl-qemu-common.h"
 
-#define PERSISTENT_DEFAULT_MAX_CNT 1000
+#ifndef AFL_QEMU_STATIC_BUILD
+  #include <dlfcn.h>
+#endif
 
 /***************************
  * VARIOUS AUXILIARY STUFF *
  ***************************/
-
-/* This snippet kicks in when the instruction pointer is positioned at
-   _start and does the usual forkserver stuff, not very different from
-   regular instrumentation injected via afl-as.h. */
-
-#define AFL_QEMU_CPU_SNIPPET2         \
-  do {                                \
-                                      \
-    if (itb->pc == afl_entry_point) { \
-                                      \
-      afl_setup();                    \
-      afl_forkserver(cpu);            \
-                                      \
-    }                                 \
-                                      \
-  } while (0)
 
 /* We use one additional file descriptor to relay "needs translation"
    messages between the child and the fork server. */
@@ -81,26 +66,34 @@ u8 afl_compcov_level;
 
 __thread abi_ulong afl_prev_loc;
 
+struct cmp_map *__afl_cmp_map;
+__thread u32    __afl_cmp_counter;
+
 /* Set in the child process in forkserver mode: */
 
-static int    forkserver_installed = 0;
+static int forkserver_installed = 0;
+static int disable_caching = 0;
+
 unsigned char afl_fork_child;
 unsigned int  afl_forksrv_pid;
 unsigned char is_persistent;
 target_long   persistent_stack_offset;
 unsigned char persistent_first_pass = 1;
 unsigned char persistent_save_gpr;
-target_ulong  persistent_saved_gpr[AFL_REGS_NUM];
+uint64_t      persistent_saved_gpr[AFL_REGS_NUM];
 int           persisent_retaddr_offset;
+
+u8 * shared_buf;
+u32 *shared_buf_len;
+u8   sharedmem_fuzzing;
+
+afl_persistent_hook_fn afl_persistent_hook_ptr;
 
 /* Instrumentation ratio: */
 
 unsigned int afl_inst_rms = MAP_SIZE;         /* Exported for afl_gen_trace */
 
 /* Function declarations. */
-
-static void afl_setup(void);
-static void afl_forkserver(CPUState *);
 
 static void afl_wait_tsl(CPUState *, int);
 static void afl_request_tsl(target_ulong, target_ulong, uint32_t, uint32_t,
@@ -134,12 +127,12 @@ struct afl_chain {
 
 /* Some forward decls: */
 
-TranslationBlock *tb_htable_lookup(CPUState *, target_ulong, target_ulong,
-                                   uint32_t, uint32_t);
 static inline TranslationBlock *tb_find(CPUState *, TranslationBlock *, int,
                                         uint32_t);
 static inline void              tb_add_jump(TranslationBlock *tb, int n,
                                             TranslationBlock *tb_next);
+int                             open_self_maps(void *cpu_env, int fd);
+static void                     afl_map_shm_fuzz(void);
 
 /*************************
  * ACTUAL IMPLEMENTATION *
@@ -147,7 +140,43 @@ static inline void              tb_add_jump(TranslationBlock *tb, int n,
 
 /* Set up SHM region and initialize other stuff. */
 
-static void afl_setup(void) {
+static void afl_map_shm_fuzz(void) {
+
+  char *id_str = getenv(SHM_FUZZ_ENV_VAR);
+
+  if (id_str) {
+
+    u32 shm_id = atoi(id_str);
+    u8 *map = (u8 *)shmat(shm_id, NULL, 0);
+    /* Whooooops. */
+
+    if (!map || map == (void *)-1) {
+
+      perror("[AFL] ERROR: could not access fuzzing shared memory");
+      exit(1);
+
+    }
+
+    shared_buf_len = (u32 *)map;
+    shared_buf = map + sizeof(u32);
+
+    if (getenv("AFL_DEBUG")) {
+
+      fprintf(stderr, "[AFL] DEBUG: successfully got fuzzing shared memory\n");
+
+    }
+
+  } else {
+
+    fprintf(stderr,
+            "[AFL] ERROR:  variable for fuzzing shared memory is not set\n");
+    exit(1);
+
+  }
+
+}
+
+void afl_setup(void) {
 
   char *id_str = getenv(SHM_ENV_VAR), *inst_r = getenv("AFL_INST_RATIO");
 
@@ -180,6 +209,22 @@ static void afl_setup(void) {
 
   }
 
+  if (getenv("___AFL_EINS_ZWEI_POLIZEI___")) {  // CmpLog forkserver
+
+    id_str = getenv(CMPLOG_SHM_ENV_VAR);
+
+    if (id_str) {
+
+      u32 shm_id = atoi(id_str);
+
+      __afl_cmp_map = shmat(shm_id, NULL, 0);
+
+      if (__afl_cmp_map == (void *)-1) exit(1);
+
+    }
+
+  }
+
   if (getenv("AFL_INST_LIBS")) {
 
     afl_start_code = 0;
@@ -206,6 +251,8 @@ static void afl_setup(void) {
 
   rcu_disable_atfork();
 
+  disable_caching = getenv("AFL_QEMU_DISABLE_CACHE") != NULL;
+
   is_persistent = getenv("AFL_QEMU_PERSISTENT_ADDR") != NULL;
 
   if (is_persistent) {
@@ -220,6 +267,48 @@ static void afl_setup(void) {
 
   if (getenv("AFL_QEMU_PERSISTENT_GPR")) persistent_save_gpr = 1;
 
+  if (getenv("AFL_QEMU_PERSISTENT_HOOK")) {
+
+#ifdef AFL_QEMU_STATIC_BUILD
+
+    fprintf(stderr,
+            "[AFL] ERROR: you cannot use AFL_QEMU_PERSISTENT_HOOK when "
+            "afl-qemu-trace is static\n");
+    exit(1);
+
+#else
+
+    persistent_save_gpr = 1;
+
+    void *plib = dlopen(getenv("AFL_QEMU_PERSISTENT_HOOK"), RTLD_NOW);
+    if (!plib) {
+
+      fprintf(stderr, "[AFL] ERROR: invalid AFL_QEMU_PERSISTENT_HOOK=%s\n",
+              getenv("AFL_QEMU_PERSISTENT_HOOK"));
+      exit(1);
+
+    }
+
+    int (*afl_persistent_hook_init_ptr)(void) =
+        dlsym(plib, "afl_persistent_hook_init");
+    if (afl_persistent_hook_init_ptr)
+      sharedmem_fuzzing = afl_persistent_hook_init_ptr();
+
+    afl_persistent_hook_ptr = dlsym(plib, "afl_persistent_hook");
+    if (!afl_persistent_hook_ptr) {
+
+      fprintf(stderr,
+              "[AFL] ERROR: failed to find the function "
+              "\"afl_persistent_hook\" in %s\n",
+              getenv("AFL_QEMU_PERSISTENT_HOOK"));
+      exit(1);
+
+    }
+
+#endif
+
+  }
+
   if (getenv("AFL_QEMU_PERSISTENT_RETADDR_OFFSET"))
     persisent_retaddr_offset =
         strtoll(getenv("AFL_QEMU_PERSISTENT_RETADDR_OFFSET"), NULL, 0);
@@ -231,36 +320,34 @@ static void afl_setup(void) {
 
 }
 
-static void print_mappings(void) {
-
-  u8    buf[MAX_LINE];
-  FILE *f = fopen("/proc/self/maps", "r");
-
-  if (!f) return;
-
-  while (fgets(buf, MAX_LINE, f))
-    printf("%s", buf);
-
-  fclose(f);
-
-}
-
 /* Fork server logic, invoked once we hit _start. */
 
-static void afl_forkserver(CPUState *cpu) {
+void afl_forkserver(CPUState *cpu) {
 
-  static unsigned char tmp[4];
+  // u32           map_size = 0;
+  unsigned char tmp[4] = {0};
 
   if (forkserver_installed == 1) return;
   forkserver_installed = 1;
 
-  if (getenv("AFL_QEMU_DEBUG_MAPS")) print_mappings();
+  if (getenv("AFL_QEMU_DEBUG_MAPS")) open_self_maps(cpu->env_ptr, 0);
 
   // if (!afl_area_ptr) return; // not necessary because of fixed dummy buffer
 
   pid_t child_pid;
   int   t_fd[2];
   u8    child_stopped = 0;
+  u32   was_killed;
+  int   status = 0;
+
+  // with the max ID value
+  if (MAP_SIZE <= FS_OPT_MAX_MAPSIZE)
+    status |= (FS_OPT_SET_MAPSIZE(MAP_SIZE) | FS_OPT_MAPSIZE);
+  if (sharedmem_fuzzing != 0) status |= FS_OPT_SHDMEM_FUZZ;
+  if (status) status |= (FS_OPT_ENABLED);
+  if (getenv("AFL_DEBUG"))
+    fprintf(stderr, "Debug: Sending status %08x\n", status);
+  memcpy(tmp, &status, 4);
 
   /* Tell the parent that we're alive. If the parent doesn't want
      to talk, assume that we're not running in forkserver mode. */
@@ -269,12 +356,29 @@ static void afl_forkserver(CPUState *cpu) {
 
   afl_forksrv_pid = getpid();
 
+  int first_run = 1;
+
+  if (sharedmem_fuzzing) {
+
+    if (read(FORKSRV_FD, &was_killed, 4) != 4) exit(2);
+
+    if ((was_killed & (0xffffffff & (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ))) ==
+        (FS_OPT_ENABLED | FS_OPT_SHDMEM_FUZZ))
+      afl_map_shm_fuzz();
+    else {
+
+      fprintf(stderr,
+              "[AFL] ERROR: afl-fuzz is old and does not support"
+              " shmem input");
+      exit(1);
+
+    }
+
+  }
+
   /* All right, let's await orders... */
 
   while (1) {
-
-    int status;
-    u32 was_killed;
 
     /* Whoops, parent dead? */
 
@@ -344,7 +448,16 @@ static void afl_forkserver(CPUState *cpu) {
        a successful run. In this case, we want to wake it up without forking
        again. */
 
-    if (WIFSTOPPED(status)) child_stopped = 1;
+    if (WIFSTOPPED(status))
+      child_stopped = 1;
+    else if (unlikely(first_run && is_persistent)) {
+
+      fprintf(stderr, "[AFL] ERROR: no persistent iteration executed\n");
+      exit(12);  // Persistent is wrong
+
+    }
+
+    first_run = 0;
 
     if (write(FORKSRV_FD + 1, &status, 4) != 4) exit(7);
 
@@ -352,12 +465,13 @@ static void afl_forkserver(CPUState *cpu) {
 
 }
 
-/* A simplified persistent mode handler, used as explained in README.llvm. */
+/* A simplified persistent mode handler, used as explained in
+ * llvm_mode/README.md. */
 
-void afl_persistent_loop() {
+void afl_persistent_loop(void) {
 
   static u32            cycle_cnt;
-  static struct afl_tsl exit_cmd_tsl = {{-1, 0, 0, 0}, NULL};
+  static struct afl_tsl exit_cmd_tsl = {{-1, 0, 0, 0}, '\0'};
 
   if (!afl_fork_child) return;
 
@@ -421,6 +535,8 @@ void afl_persistent_loop() {
 static void afl_request_tsl(target_ulong pc, target_ulong cb, uint32_t flags,
                             uint32_t cf_mask, TranslationBlock *last_tb,
                             int tb_exit) {
+
+  if (disable_caching) return;
 
   struct afl_tsl   t;
   struct afl_chain c;

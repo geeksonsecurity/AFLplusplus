@@ -8,13 +8,13 @@
 //
 
 /*
-   american fuzzy lop - GCC instrumentation pass
+   american fuzzy lop++ - GCC instrumentation pass
    ---------------------------------------------
 
    Written by Austin Seipp <aseipp@pobox.com> with bits from
               Emese Revfy <re.emese@gmail.com>
 
-   Fixed by Heiko Eißfeldt 2019 for AFL++
+   Fixed by Heiko Eißfeldt 2019-2020 for AFL++
 
    GCC integration design is based on the LLVM design, which comes
    from Laszlo Szekeres. Some of the boilerplate code below for
@@ -49,16 +49,16 @@
 
 #define BUILD_INLINE_INST
 
-#include "../config.h"
+#include "../include/config.h"
 #include "../include/debug.h"
 
-/* clear helper AFL types pulls in, which intervene with gcc-plugin geaders from
- * GCC-8 */
+/* clear helper macros AFL types pull in, which intervene with gcc-plugin
+ * headers from GCC-8 */
 #ifdef likely
-#undef likely
+  #undef likely
 #endif
 #ifdef unlikely
-#undef unlikely
+  #undef unlikely
 #endif
 
 #include <stdio.h>
@@ -166,7 +166,7 @@ static unsigned int ext_call_instrument(function *fun) {
     fcall = gimple_build_call(
         fndecl, 1,
         cur_loc); /* generate the function _call_ to above built reference, with
-                     *1* parameter -> the random const for the location */
+                   *1* parameter -> the random const for the location */
     gimple_seq_add_stmt(&seq, fcall);         /* and insert into a sequence */
 
     /* Done - grab the entry to the block and insert sequence */
@@ -202,9 +202,8 @@ static unsigned int inline_instrument(function *fun) {
   basic_block bb;
   unsigned    finst_blocks = 0;
   unsigned    fcnt_blocks = 0;
-  tree one = build_int_cst(unsigned_char_type_node, 1);
+  tree        one = build_int_cst(unsigned_char_type_node, 1);
   // tree zero = build_int_cst(unsigned_char_type_node, 0);
-
 
   /* Set up global type declarations */
   tree map_type = build_pointer_type(unsigned_char_type_node);
@@ -296,16 +295,16 @@ static unsigned int inline_instrument(function *fun) {
     update_stmt(g);
 
 #if 1
-#if 0
+  #if 0
 		tree addr = build2(ADDR_EXPR, map_type, map_ptr, area_off);
 		g = gimple_build_assign(map_ptr2, MODIFY_EXPR, addr);
 		gimple_seq_add_stmt(&seq, g); // map_ptr2 = map_ptr + area_off
 		update_stmt(g);
-#else
+  #else
     g = gimple_build_assign(map_ptr2, PLUS_EXPR, map_ptr, area_off);
     gimple_seq_add_stmt(&seq, g);  // map_ptr2 = map_ptr + area_off
     update_stmt(g);
-#endif
+  #endif
 
     // gimple_assign <mem_ref, _3, *p_6, NULL, NULL>
     tree tmp1 = create_tmp_var_raw(unsigned_char_type_node, "tmp1");
@@ -417,8 +416,8 @@ class afl_pass : public gimple_opt_pass {
 
     if (!myWhitelist.empty()) {
 
-      bool instrumentBlock = false;
-      std::string instFilename;
+      bool         instrumentBlock = false;
+      std::string  instFilename;
       unsigned int instLine = 0;
 
       /* EXPR_FILENAME
@@ -467,13 +466,17 @@ class afl_pass : public gimple_opt_pass {
       if (!instrumentBlock) {
 
         if (!be_quiet) {
-             if (!instFilename.empty())
-               SAYF(cYEL "[!] " cBRI "Not in whitelist, skipping %s line %u...\n",
-                    instFilename.c_str(), instLine);
-             else
-               SAYF(cYEL "[!] " cBRI "No filename information found, skipping it");
+
+          if (!instFilename.empty())
+            SAYF(cYEL "[!] " cBRI "Not in whitelist, skipping %s line %u...\n",
+                 instFilename.c_str(), instLine);
+          else
+            SAYF(cYEL "[!] " cBRI "No filename information found, skipping it");
+
         }
+
         return 0;
+
       }
 
     }
@@ -499,7 +502,7 @@ int plugin_is_GPL_compatible = 1;
 
 static struct plugin_info afl_plugin_info = {
 
-    .version = "20191015",
+    .version = "20200519",
     .help = "AFL++ gcc plugin\n",
 
 };
@@ -525,12 +528,13 @@ int plugin_init(struct plugin_name_args *  plugin_info,
 
   if (!plugin_default_version_check(version, &gcc_version)) {
 
-    FATAL(G_("Incompatible gcc/plugin versions!"));
+    FATAL(G_("Incompatible gcc/plugin versions! Expected GCC %d.%d"),
+          GCCPLUGIN_VERSION_MAJOR, GCCPLUGIN_VERSION_MINOR);
 
   }
 
   /* Show a banner */
-  if (isatty(2) && !getenv("AFL_QUIET")) {
+  if ((isatty(2) && !getenv("AFL_QUIET")) || getenv("AFL_DEBUG") != NULL) {
 
     SAYF(G_(cCYA "afl-gcc-pass" VERSION cRST
                  " initially by <aseipp@pobox.com>, maintainer: hexcoder-\n"));
@@ -564,7 +568,7 @@ int plugin_init(struct plugin_name_args *  plugin_info,
     std::string   line;
     std::ifstream fileStream;
     fileStream.open(instWhiteListFilename);
-    if (!fileStream) fatal_error(0, "Unable to open AFL_GCC_WHITELIST");
+    if (!fileStream) PFATAL("Unable to open AFL_GCC_WHITELIST");
     getline(fileStream, line);
     while (fileStream) {
 

@@ -1,5 +1,5 @@
 /*
-   american fuzzy lop - GCC plugin instrumentation bootstrap
+   american fuzzy lop++ - GCC plugin instrumentation bootstrap
    ---------------------------------------------------------
 
    Written by Austin Seipp <aseipp@pobox.com> and
@@ -20,11 +20,14 @@
 */
 
 #ifdef __ANDROID__
-#include "android-ashmem.h"
+  #include "android-ashmem.h"
 #endif
 #include "../config.h"
 #include "../types.h"
 
+#ifdef USEMMAP
+  #include <stdio.h>
+#endif
 #include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>
@@ -48,16 +51,18 @@ u8 *__afl_area_ptr = __afl_area_initial;
 
 #ifdef __ANDROID__
 u32 __afl_prev_loc;
+u32 __afl_final_loc;
 #else
 __thread u32 __afl_prev_loc;
+__thread u32 __afl_final_loc;
 #endif
 
 /* Trace a basic block with some ID */
 void __afl_trace(const u32 x) {
 
-#if 1 /* enable for neverZero feature. */
-  __afl_area_ptr[__afl_prev_loc ^ x] += 1 
-                               + ((u8)(1 + __afl_area_ptr[__afl_prev_loc ^ x]) == 0);
+#if 1                                      /* enable for neverZero feature. */
+  __afl_area_ptr[__afl_prev_loc ^ x] +=
+      1 + ((u8)(1 + __afl_area_ptr[__afl_prev_loc ^ x]) == 0);
 #else
   ++__afl_area_ptr[__afl_prev_loc ^ x];
 #endif
@@ -84,15 +89,15 @@ static void __afl_map_shm(void) {
   if (id_str) {
 
 #ifdef USEMMAP
-    const char*    shm_file_path = id_str;
+    const char *   shm_file_path = id_str;
     int            shm_fd = -1;
-    unsigned char* shm_base = NULL;
+    unsigned char *shm_base = NULL;
 
     /* create the shared memory segment as if it was a file */
     shm_fd = shm_open(shm_file_path, O_RDWR, 0600);
     if (shm_fd == -1) {
 
-      printf("shm_open() failed\n");
+      fprintf(stderr, "shm_open() failed\n");
       exit(1);
 
     }
@@ -104,7 +109,7 @@ static void __afl_map_shm(void) {
       close(shm_fd);
       shm_fd = -1;
 
-      printf("mmap() failed\n");
+      fprintf(stderr, "mmap() failed\n");
       exit(2);
 
     }
@@ -133,8 +138,9 @@ static void __afl_map_shm(void) {
 
 static void __afl_start_forkserver(void) {
 
-  static u8 tmp[4];
-  s32       child_pid;
+  u8  tmp[4] = {0, 0, 0, 0};
+  u32 map_size = MAP_SIZE;
+  s32 child_pid;
 
   u8 child_stopped = 0;
 
@@ -142,6 +148,13 @@ static void __afl_start_forkserver(void) {
 
   /* Phone home and tell the parent that we're OK. If parent isn't there,
      assume we're not running in forkserver mode and just execute program. */
+
+  if (MAP_SIZE <= 0x800000) {
+
+    map_size = (FS_OPT_ENABLED | FS_OPT_MAPSIZE | FS_OPT_SET_MAPSIZE(MAP_SIZE));
+    memcpy(tmp, &map_size, 4);
+
+  }
 
   if (write(FORKSRV_FD + 1, tmp, 4) != 4) return;
 
@@ -214,7 +227,7 @@ static void __afl_start_forkserver(void) {
 
 }
 
-/* A simplified persistent mode handler, used as explained in README.llvm. */
+/* A simplified persistent mode handler, used as explained in README.md. */
 
 int __afl_persistent_loop(unsigned int max_cnt) {
 
@@ -265,7 +278,7 @@ int __afl_persistent_loop(unsigned int max_cnt) {
 
   }
 
-    return 0;
+  return 0;
 
 }
 

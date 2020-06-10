@@ -18,6 +18,12 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <list>
+#include <string>
+#include <fstream>
+#include <sys/time.h>
+#include "llvm/Config/llvm-config.h"
+
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -26,11 +32,21 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
-#include "llvm/IR/Verifier.h"
 #include "llvm/Pass.h"
 #include "llvm/Analysis/ValueTracking.h"
 
+#if LLVM_VERSION_MAJOR > 3 || \
+    (LLVM_VERSION_MAJOR == 3 && LLVM_VERSION_MINOR > 4)
+  #include "llvm/IR/Verifier.h"
+  #include "llvm/IR/DebugInfo.h"
+#else
+  #include "llvm/Analysis/Verifier.h"
+  #include "llvm/DebugInfo.h"
+  #define nullptr 0
+#endif
+
 #include <set>
+#include "afl-llvm-common.h"
 
 using namespace llvm;
 
@@ -41,6 +57,8 @@ class CompareTransform : public ModulePass {
  public:
   static char ID;
   CompareTransform() : ModulePass(ID) {
+
+    initWhitelist();
 
   }
 
@@ -56,6 +74,9 @@ class CompareTransform : public ModulePass {
     return "transforms compare functions";
 
   }
+
+ protected:
+  int be_quiet = 0;
 
  private:
   bool transformCmps(Module &M, const bool processStrcmp,
@@ -75,11 +96,12 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
                                      const bool processStrcasecmp,
                                      const bool processStrncasecmp) {
 
-  std::vector<CallInst *> calls;
-  LLVMContext &           C = M.getContext();
-  IntegerType *           Int8Ty = IntegerType::getInt8Ty(C);
-  IntegerType *           Int32Ty = IntegerType::getInt32Ty(C);
-  IntegerType *           Int64Ty = IntegerType::getInt64Ty(C);
+  DenseMap<Value *, std::string *> valueMap;
+  std::vector<CallInst *>          calls;
+  LLVMContext &                    C = M.getContext();
+  IntegerType *                    Int8Ty = IntegerType::getInt8Ty(C);
+  IntegerType *                    Int32Ty = IntegerType::getInt32Ty(C);
+  IntegerType *                    Int64Ty = IntegerType::getInt64Ty(C);
 
 #if LLVM_VERSION_MAJOR < 9
   Constant *
@@ -89,7 +111,7 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
       c = M.getOrInsertFunction("tolower", Int32Ty, Int32Ty
 #if LLVM_VERSION_MAJOR < 5
                                 ,
-                                nullptr
+                                NULL
 #endif
       );
 #if LLVM_VERSION_MAJOR < 9
@@ -101,6 +123,8 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
   /* iterate over all functions, bbs and instruction and add suitable calls to
    * strcmp/memcmp/strncmp/strcasecmp/strncasecmp */
   for (auto &F : M) {
+
+    if (!isInWhitelist(&F)) continue;
 
     for (auto &BB : F) {
 
@@ -115,6 +139,8 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
           bool isStrncmp = processStrncmp;
           bool isStrcasecmp = processStrcasecmp;
           bool isStrncasecmp = processStrncasecmp;
+          bool isIntMemcpy = true;
+          bool indirect = false;
 
           Function *Callee = callInst->getCalledFunction();
           if (!Callee) continue;
@@ -125,9 +151,10 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
           isStrncmp &= !FuncName.compare(StringRef("strncmp"));
           isStrcasecmp &= !FuncName.compare(StringRef("strcasecmp"));
           isStrncasecmp &= !FuncName.compare(StringRef("strncasecmp"));
+          isIntMemcpy &= !FuncName.compare("llvm.memcpy.p0i8.p0i8.i64");
 
           if (!isStrcmp && !isMemcmp && !isStrncmp && !isStrcasecmp &&
-              !isStrncasecmp)
+              !isStrncasecmp && !isIntMemcpy)
             continue;
 
           /* Verify the strcmp/memcmp/strncmp/strcasecmp/strncasecmp function
@@ -161,7 +188,7 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
                            FT->getParamType(2)->isIntegerTy();
 
           if (!isStrcmp && !isMemcmp && !isStrncmp && !isStrcasecmp &&
-              !isStrncasecmp)
+              !isStrncasecmp && !isIntMemcpy)
             continue;
 
           /* is a str{n,}{case,}cmp/memcmp, check if we have
@@ -174,8 +201,107 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
           bool      HasStr1 = getConstantStringInfo(Str1P, Str1);
           bool      HasStr2 = getConstantStringInfo(Str2P, Str2);
 
+          if (isIntMemcpy && HasStr2) {
+
+            valueMap[Str1P] = new std::string(Str2.str());
+            // fprintf(stderr, "saved %s for %p\n", Str2.str().c_str(), Str1P);
+            continue;
+
+          }
+
+          // not literal? maybe global or local variable
+          if (!(HasStr1 || HasStr2)) {
+
+            auto *Ptr = dyn_cast<ConstantExpr>(Str2P);
+            if (Ptr && Ptr->isGEPWithNoNotionalOverIndexing()) {
+
+              if (auto *Var = dyn_cast<GlobalVariable>(Ptr->getOperand(0))) {
+
+                if (Var->hasInitializer()) {
+
+                  if (auto *Array =
+                          dyn_cast<ConstantDataArray>(Var->getInitializer())) {
+
+                    HasStr2 = true;
+                    Str2 = Array->getAsString();
+                    valueMap[Str2P] = new std::string(Str2.str());
+                    fprintf(stderr, "glo2 %s\n", Str2.str().c_str());
+
+                  }
+
+                }
+
+              }
+
+            }
+
+            if (!HasStr2) {
+
+              auto *Ptr = dyn_cast<ConstantExpr>(Str1P);
+              if (Ptr && Ptr->isGEPWithNoNotionalOverIndexing()) {
+
+                if (auto *Var = dyn_cast<GlobalVariable>(Ptr->getOperand(0))) {
+
+                  if (Var->hasInitializer()) {
+
+                    if (auto *Array = dyn_cast<ConstantDataArray>(
+                            Var->getInitializer())) {
+
+                      HasStr1 = true;
+                      Str1 = Array->getAsString();
+                      valueMap[Str1P] = new std::string(Str1.str());
+                      // fprintf(stderr, "glo1 %s\n", Str1.str().c_str());
+
+                    }
+
+                  }
+
+                }
+
+              }
+
+            } else if (isIntMemcpy) {
+
+              valueMap[Str1P] = new std::string(Str2.str());
+              // fprintf(stderr, "saved\n");
+
+            }
+
+            if ((HasStr1 || HasStr2)) indirect = true;
+
+          }
+
+          if (isIntMemcpy) continue;
+
+          if (!(HasStr1 || HasStr2)) {
+
+            // do we have a saved local variable initialization?
+            std::string *val = valueMap[Str1P];
+            if (val && !val->empty()) {
+
+              Str1 = StringRef(*val);
+              HasStr1 = true;
+              indirect = true;
+              // fprintf(stderr, "loaded1 %s\n", Str1.str().c_str());
+
+            } else {
+
+              val = valueMap[Str2P];
+              if (val && !val->empty()) {
+
+                Str2 = StringRef(*val);
+                HasStr2 = true;
+                indirect = true;
+                // fprintf(stderr, "loaded2 %s\n", Str2.str().c_str());
+
+              }
+
+            }
+
+          }
+
           /* handle cases of one string is const, one string is variable */
-          if (!(HasStr1 ^ HasStr2)) continue;
+          if (!(HasStr1 || HasStr2)) continue;
 
           if (isMemcmp || isStrncmp || isStrncasecmp) {
 
@@ -183,12 +309,28 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
              * strlen("constStr") and sizeof() are treated as constant */
             Value *      op2 = callInst->getArgOperand(2);
             ConstantInt *ilen = dyn_cast<ConstantInt>(op2);
-            if (!ilen) continue;
-            /* final precaution: if size of compare is larger than constant
-             * string skip it*/
-            uint64_t literalLength =
-                HasStr1 ? GetStringLength(Str1P) : GetStringLength(Str2P);
-            if (literalLength < ilen->getZExtValue()) continue;
+            if (ilen) {
+
+              uint64_t len = ilen->getZExtValue();
+              // if len is zero this is a pointless call but allow real
+              // implementation to worry about that
+              if (!len) continue;
+
+              if (isMemcmp) {
+
+                // if size of compare is larger than constant string this is
+                // likely a bug but allow real implementation to worry about
+                // that
+                uint64_t literalLength = HasStr1 ? Str1.size() : Str2.size();
+                if (literalLength + 1 < ilen->getZExtValue()) continue;
+
+              }
+
+            } else if (isMemcmp)
+
+              // this *may* supply a len greater than the constant string at
+              // runtime so similarly we don't want to have to handle that
+              continue;
 
           }
 
@@ -203,8 +345,9 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
   }
 
   if (!calls.size()) return false;
-  errs() << "Replacing " << calls.size()
-         << " calls to strcmp/memcmp/strncmp/strcasecmp/strncasecmp\n";
+  if (!be_quiet)
+    errs() << "Replacing " << calls.size()
+           << " calls to strcmp/memcmp/strncmp/strcasecmp/strncasecmp\n";
 
   for (auto &callInst : calls) {
 
@@ -214,29 +357,48 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
     std::string TmpConstStr;
     Value *     VarStr;
     bool        HasStr1 = getConstantStringInfo(Str1P, Str1);
-    getConstantStringInfo(Str2P, Str2);
-    uint64_t constLen, sizedLen;
-    bool     isMemcmp =
+    bool        HasStr2 = getConstantStringInfo(Str2P, Str2);
+    uint64_t    constStrLen, constSizedLen, unrollLen;
+    bool        isMemcmp =
         !callInst->getCalledFunction()->getName().compare(StringRef("memcmp"));
     bool isSizedcmp = isMemcmp ||
                       !callInst->getCalledFunction()->getName().compare(
                           StringRef("strncmp")) ||
                       !callInst->getCalledFunction()->getName().compare(
                           StringRef("strncasecmp"));
+    Value *sizedValue = isSizedcmp ? callInst->getArgOperand(2) : NULL;
+    bool   isConstSized = sizedValue && isa<ConstantInt>(sizedValue);
     bool isCaseInsensitive = !callInst->getCalledFunction()->getName().compare(
                                  StringRef("strcasecmp")) ||
                              !callInst->getCalledFunction()->getName().compare(
                                  StringRef("strncasecmp"));
 
-    if (isSizedcmp) {
+    if (!(HasStr1 || HasStr2)) {
 
-      Value *      op2 = callInst->getArgOperand(2);
-      ConstantInt *ilen = dyn_cast<ConstantInt>(op2);
-      sizedLen = ilen->getZExtValue();
+      // do we have a saved local or global variable initialization?
+      std::string *val = valueMap[Str1P];
+      if (val && !val->empty()) {
 
-    } else {
+        Str1 = StringRef(*val);
+        HasStr1 = true;
 
-      sizedLen = 0;
+      } else {
+
+        val = valueMap[Str2P];
+        if (val && !val->empty()) {
+
+          Str2 = StringRef(*val);
+          HasStr2 = true;
+
+        }
+
+      }
+
+    }
+
+    if (isConstSized) {
+
+      constSizedLen = dyn_cast<ConstantInt>(sizedValue)->getZExtValue();
 
     }
 
@@ -244,83 +406,133 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
 
       TmpConstStr = Str1.str();
       VarStr = Str2P;
-      constLen = isMemcmp ? sizedLen : GetStringLength(Str1P);
 
     } else {
 
       TmpConstStr = Str2.str();
       VarStr = Str1P;
-      constLen = isMemcmp ? sizedLen : GetStringLength(Str2P);
 
     }
 
-    /* properly handle zero terminated C strings by adding the terminating 0 to
-     * the StringRef (in comparison to std::string a StringRef has built-in
-     * runtime bounds checking, which makes debugging easier) */
+    // add null termination character implicit in c strings
     TmpConstStr.append("\0", 1);
+
+    // in the unusual case the const str has embedded null
+    // characters, the string comparison functions should terminate
+    // at the first null
+    if (!isMemcmp)
+      TmpConstStr.assign(TmpConstStr, 0, TmpConstStr.find('\0') + 1);
+
+    constStrLen = TmpConstStr.length();
+    // prefer use of StringRef (in comparison to std::string a StringRef has
+    // built-in runtime bounds checking, which makes debugging easier)
     ConstStr = StringRef(TmpConstStr);
 
-    if (isSizedcmp && constLen > sizedLen) { constLen = sizedLen; }
+    if (isConstSized)
+      unrollLen = constSizedLen < constStrLen ? constSizedLen : constStrLen;
+    else
+      unrollLen = constStrLen;
 
-    errs() << callInst->getCalledFunction()->getName() << ": len " << constLen
-           << ": " << ConstStr << "\n";
+    if (!be_quiet)
+      errs() << callInst->getCalledFunction()->getName() << ": unroll len "
+             << unrollLen
+             << ((isSizedcmp && !isConstSized) ? ", variable n" : "") << ": "
+             << ConstStr << "\n";
 
     /* split before the call instruction */
     BasicBlock *bb = callInst->getParent();
     BasicBlock *end_bb = bb->splitBasicBlock(BasicBlock::iterator(callInst));
-    BasicBlock *next_bb =
+
+    BasicBlock *next_lenchk_bb = NULL;
+    if (isSizedcmp && !isConstSized) {
+
+      next_lenchk_bb =
+          BasicBlock::Create(C, "len_check", end_bb->getParent(), end_bb);
+      BranchInst::Create(end_bb, next_lenchk_bb);
+
+    }
+
+    BasicBlock *next_cmp_bb =
         BasicBlock::Create(C, "cmp_added", end_bb->getParent(), end_bb);
-    BranchInst::Create(end_bb, next_bb);
-    PHINode *PN = PHINode::Create(Int32Ty, constLen + 1, "cmp_phi");
+    BranchInst::Create(end_bb, next_cmp_bb);
+    PHINode *PN = PHINode::Create(
+        Int32Ty, (next_lenchk_bb ? 2 : 1) * unrollLen + 1, "cmp_phi");
 
 #if LLVM_VERSION_MAJOR < 8
     TerminatorInst *term = bb->getTerminator();
 #else
     Instruction *term = bb->getTerminator();
 #endif
-    BranchInst::Create(next_bb, bb);
+    BranchInst::Create(next_lenchk_bb ? next_lenchk_bb : next_cmp_bb, bb);
     term->eraseFromParent();
 
-    for (uint64_t i = 0; i < constLen; i++) {
+    for (uint64_t i = 0; i < unrollLen; i++) {
 
-      BasicBlock *cur_bb = next_bb;
+      BasicBlock *  cur_cmp_bb = next_cmp_bb, *cur_lenchk_bb = next_lenchk_bb;
+      unsigned char c;
 
-      char c = isCaseInsensitive ? tolower(ConstStr[i]) : ConstStr[i];
+      if (cur_lenchk_bb) {
 
-      BasicBlock::iterator IP = next_bb->getFirstInsertionPt();
-      IRBuilder<>          IRB(&*IP);
+        IRBuilder<> cur_lenchk_IRB(&*(cur_lenchk_bb->getFirstInsertionPt()));
+        Value *     icmp = cur_lenchk_IRB.CreateICmpEQ(sizedValue,
+                                                  ConstantInt::get(Int64Ty, i));
+        cur_lenchk_IRB.CreateCondBr(icmp, end_bb, cur_cmp_bb);
+        cur_lenchk_bb->getTerminator()->eraseFromParent();
+
+        PN->addIncoming(ConstantInt::get(Int32Ty, 0), cur_lenchk_bb);
+
+      }
+
+      if (isCaseInsensitive)
+        c = (unsigned char)(tolower((int)ConstStr[i]) & 0xff);
+      else
+        c = (unsigned char)ConstStr[i];
+
+      IRBuilder<> cur_cmp_IRB(&*(cur_cmp_bb->getFirstInsertionPt()));
 
       Value *v = ConstantInt::get(Int64Ty, i);
-      Value *ele = IRB.CreateInBoundsGEP(VarStr, v, "empty");
-      Value *load = IRB.CreateLoad(ele);
+      Value *ele = cur_cmp_IRB.CreateInBoundsGEP(VarStr, v, "empty");
+      Value *load = cur_cmp_IRB.CreateLoad(ele);
+
       if (isCaseInsensitive) {
 
         // load >= 'A' && load <= 'Z' ? load | 0x020 : load
+        load = cur_cmp_IRB.CreateZExt(load, Int32Ty);
         std::vector<Value *> args;
         args.push_back(load);
-        load = IRB.CreateCall(tolowerFn, args, "tmp");
-        load = IRB.CreateTrunc(load, Int8Ty);
+        load = cur_cmp_IRB.CreateCall(tolowerFn, args, "tmp");
+        load = cur_cmp_IRB.CreateTrunc(load, Int8Ty);
 
       }
 
       Value *isub;
       if (HasStr1)
-        isub = IRB.CreateSub(ConstantInt::get(Int8Ty, c), load);
+        isub = cur_cmp_IRB.CreateSub(ConstantInt::get(Int8Ty, c), load);
       else
-        isub = IRB.CreateSub(load, ConstantInt::get(Int8Ty, c));
+        isub = cur_cmp_IRB.CreateSub(load, ConstantInt::get(Int8Ty, c));
 
-      Value *sext = IRB.CreateSExt(isub, Int32Ty);
-      PN->addIncoming(sext, cur_bb);
+      Value *sext = cur_cmp_IRB.CreateSExt(isub, Int32Ty);
+      PN->addIncoming(sext, cur_cmp_bb);
 
-      if (i < constLen - 1) {
+      if (i < unrollLen - 1) {
 
-        next_bb =
+        if (cur_lenchk_bb) {
+
+          next_lenchk_bb =
+              BasicBlock::Create(C, "len_check", end_bb->getParent(), end_bb);
+          BranchInst::Create(end_bb, next_lenchk_bb);
+
+        }
+
+        next_cmp_bb =
             BasicBlock::Create(C, "cmp_added", end_bb->getParent(), end_bb);
-        BranchInst::Create(end_bb, next_bb);
+        BranchInst::Create(end_bb, next_cmp_bb);
 
-        Value *icmp = IRB.CreateICmpEQ(isub, ConstantInt::get(Int8Ty, 0));
-        IRB.CreateCondBr(icmp, next_bb, end_bb);
-        cur_bb->getTerminator()->eraseFromParent();
+        Value *icmp =
+            cur_cmp_IRB.CreateICmpEQ(isub, ConstantInt::get(Int8Ty, 0));
+        cur_cmp_IRB.CreateCondBr(
+            icmp, next_lenchk_bb ? next_lenchk_bb : next_cmp_bb, end_bb);
+        cur_cmp_bb->getTerminator()->eraseFromParent();
 
       } else {
 
@@ -350,9 +562,11 @@ bool CompareTransform::transformCmps(Module &M, const bool processStrcmp,
 
 bool CompareTransform::runOnModule(Module &M) {
 
-  if (getenv("AFL_QUIET") == NULL)
+  if ((isatty(2) && getenv("AFL_QUIET") == NULL) || getenv("AFL_DEBUG") != NULL)
     llvm::errs() << "Running compare-transform-pass by laf.intel@gmail.com, "
                     "extended by heiko@hexco.de\n";
+  else
+    be_quiet = 1;
   transformCmps(M, true, true, true, true, true);
   verifyModule(M);
 

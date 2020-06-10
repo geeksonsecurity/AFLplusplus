@@ -1,15 +1,15 @@
 /*
-   american fuzzy lop - free CPU gizmo
+   american fuzzy lop++ - free CPU gizmo
    -----------------------------------
 
    Originally written by Michal Zalewski
 
-   Now maintained by by Marc Heuse <mh@mh-sec.de>,
+   Now maintained by Marc Heuse <mh@mh-sec.de>,
                         Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
                         Andrea Fioraldi <andreafioraldi@gmail.com>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@
 
    This tool provides a fairly accurate measurement of CPU preemption rate.
    It is meant to complement the quick-and-dirty load average widget shown
-   in the afl-fuzz UI. See docs/parallel_fuzzing.txt for more info.
+   in the afl-fuzz UI. See docs/parallel_fuzzing.md for more info.
 
    For some work loads, the tool may actually suggest running more instances
    than you have CPU cores. This can happen if the tested program is spending
@@ -32,11 +32,11 @@
 
 #define AFL_MAIN
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE
+  #define _GNU_SOURCE
 #endif
 
 #ifdef __ANDROID__
-#include "android-ashmem.h"
+  #include "android-ashmem.h"
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,38 +51,27 @@
 
 #include "types.h"
 #include "debug.h"
+#include "common.h"
 
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__APPLE__) || defined(__DragonFly__)
-#define HAVE_AFFINITY 1
-#if defined(__FreeBSD__) || defined(__DragonFly__)
-#include <pthread.h>
-#include <pthread_np.h>
-#if defined(__FreeBSD__)
-#include <sys/cpuset.h>
-#endif
-#define cpu_set_t cpuset_t
-#elif defined(__NetBSD__)
-#include <pthread.h>
-#include <sched.h>
-#elif defined(__APPLE__)
-#include <pthread.h>
-#include <mach/thread_act.h>
-#include <mach/thread_policy.h>
-#endif
-#endif                            /* __linux__ || __FreeBSD__ || __NetBSD__ || __APPLE__ */
-
-/* Get unix time in microseconds. */
-
-static u64 get_cur_time_us(void) {
-
-  struct timeval  tv;
-  struct timezone tz;
-
-  gettimeofday(&tv, &tz);
-
-  return (tv.tv_sec * 1000000ULL) + tv.tv_usec;
-
-}
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+    defined(__APPLE__) || defined(__DragonFly__)
+  #define HAVE_AFFINITY 1
+  #if defined(__FreeBSD__) || defined(__DragonFly__)
+    #include <pthread.h>
+    #include <pthread_np.h>
+    #if defined(__FreeBSD__)
+      #include <sys/cpuset.h>
+    #endif
+    #define cpu_set_t cpuset_t
+  #elif defined(__NetBSD__)
+    #include <pthread.h>
+    #include <sched.h>
+  #elif defined(__APPLE__)
+    #include <pthread.h>
+    #include <mach/thread_act.h>
+    #include <mach/thread_policy.h>
+  #endif
+#endif               /* __linux__ || __FreeBSD__ || __NetBSD__ || __APPLE__ */
 
 /* Get CPU usage in microseconds. */
 
@@ -101,7 +90,7 @@ static u64 get_cpu_usage_us(void) {
 
 static u32 measure_preemption(u32 target_ms) {
 
-  static volatile u32 v1, v2;
+  volatile u32 v1, v2 = 0;
 
   u64 st_t, en_t, st_c, en_c, real_delta, slice_delta;
   s32 loop_repeats = 0;
@@ -113,8 +102,12 @@ repeat_loop:
 
   v1 = CTEST_BUSY_CYCLES;
 
-  while (v1--)
+  while (v1--) {
+
     v2++;
+
+  }
+
   sched_yield();
 
   en_t = get_cur_time_us();
@@ -140,7 +133,7 @@ repeat_loop:
 
 /* Do the benchmark thing. */
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
 
   if (argc > 1) {
 
@@ -165,53 +158,57 @@ int main(int argc, char** argv) {
 
     s32 fr = fork();
 
-    if (fr < 0) PFATAL("fork failed");
+    if (fr < 0) { PFATAL("fork failed"); }
 
     if (!fr) {
 
       u32 util_perc;
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__DragonFly__)
+  #if defined(__linux__) || defined(__FreeBSD__) || defined(__DragonFly__)
       cpu_set_t c;
 
       CPU_ZERO(&c);
       CPU_SET(i, &c);
-#elif defined(__NetBSD__)
-      cpuset_t* c;
+  #elif defined(__NetBSD__)
+      cpuset_t *c;
 
       c = cpuset_create();
       if (c == NULL) PFATAL("cpuset_create failed");
 
       cpuset_set(i, c);
-#elif defined(__APPLE__)
-      thread_affinity_policy_data_t c = { i };
+  #elif defined(__APPLE__)
+      thread_affinity_policy_data_t c = {i};
       thread_port_t native_thread = pthread_mach_thread_np(pthread_self());
       if (thread_policy_set(native_thread, THREAD_AFFINITY_POLICY,
-	 (thread_policy_t)&c, 1) != KERN_SUCCESS)
-	PFATAL("thread_policy_set failed");
-#endif
+                            (thread_policy_t)&c, 1) != KERN_SUCCESS)
+        PFATAL("thread_policy_set failed");
+  #endif
 
-#if defined(__FreeBSD__) || defined(__DragonFly__)
+  #if defined(__FreeBSD__) || defined(__DragonFly__)
       if (pthread_setaffinity_np(pthread_self(), sizeof(c), &c))
         PFATAL("pthread_setaffinity_np failed");
-#endif
+  #endif
 
-#if defined(__NetBSD__)
+  #if defined(__NetBSD__)
       if (pthread_setaffinity_np(pthread_self(), cpuset_size(c), c))
         PFATAL("pthread_setaffinity_np failed");
 
       cpuset_destroy(c);
-#endif
+  #endif
 
-#if defined(__linux__)
-      if (sched_setaffinity(0, sizeof(c), &c))
+  #if defined(__linux__)
+      if (sched_setaffinity(0, sizeof(c), &c)) {
+
         PFATAL("sched_setaffinity failed for cpu %d", i);
-#endif
+
+      }
+
+  #endif
 
       util_perc = measure_preemption(CTEST_CORE_TRG_MS);
 
       if (util_perc < 110) {
 
-        SAYF("    Core #%u: " cLGN "AVAILABLE\n" cRST, i);
+        SAYF("    Core #%u: " cLGN "AVAILABLE" cRST "(%u%%)\n", i, util_perc);
         exit(0);
 
       } else if (util_perc < 250) {
@@ -232,10 +229,10 @@ int main(int argc, char** argv) {
   for (i = 0; i < cpu_cnt; i++) {
 
     int ret;
-    if (waitpid(-1, &ret, 0) < 0) PFATAL("waitpid failed");
+    if (waitpid(-1, &ret, 0) < 0) { PFATAL("waitpid failed"); }
 
-    if (WEXITSTATUS(ret) == 0) idle_cpus++;
-    if (WEXITSTATUS(ret) <= 1) maybe_cpus++;
+    if (WEXITSTATUS(ret) == 0) { idle_cpus++; }
+    if (WEXITSTATUS(ret) <= 1) { maybe_cpus++; }
 
   }
 

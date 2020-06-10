@@ -6,7 +6,7 @@
 # Written and maintaned by Andrea Fioraldi <andreafioraldi@gmail.com>
 #
 # Copyright 2015, 2016, 2017 Google Inc. All rights reserved.
-# Copyright 2019 AFLplusplus Project. All rights reserved.
+# Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,26 +27,31 @@ with open(".clang-format") as f:
 
 CLANG_FORMAT_BIN = os.getenv("CLANG_FORMAT_BIN")
 if CLANG_FORMAT_BIN is None:
-    p = subprocess.Popen(["clang-format", "--version"], stdout=subprocess.PIPE)
-    o, _ = p.communicate()
-    o = str(o, "utf-8")
-    o = o[len("clang-format version "):].strip()
-    o = o[:o.find(".")]
-    o = int(o)
-    if o < 7:
-        if subprocess.call(['which', 'clang-format-7'], stdout=subprocess.PIPE) == 0:
-            CLANG_FORMAT_BIN = 'clang-format-7'
-        elif subprocess.call(['which', 'clang-format-8'], stdout=subprocess.PIPE) == 0:
-            CLANG_FORMAT_BIN = 'clang-format-8'
-        elif subprocess.call(['which', 'clang-format-9'], stdout=subprocess.PIPE) == 0:
-            CLANG_FORMAT_BIN = 'clang-format-9'
-        elif subprocess.call(['which', 'clang-format-10'], stdout=subprocess.PIPE) == 0:
-            CLANG_FORMAT_BIN = 'clang-format-10'
-        else:
-            print ("clang-format 7 or above is needed. Aborted.")
-            exit(1)
+    o = 0
+    try:
+        p = subprocess.Popen(["clang-format-10", "--version"], stdout=subprocess.PIPE)
+        o, _ = p.communicate()
+        o = str(o, "utf-8")
+        o = o[len("clang-format version "):].strip()
+        o = o[:o.find(".")]
+        o = int(o)
+    except:
+        print ("clang-format-10 is needed. Aborted.")
+        exit(1)
+    #if o < 7:
+    #    if subprocess.call(['which', 'clang-format-7'], stdout=subprocess.PIPE) == 0:
+    #        CLANG_FORMAT_BIN = 'clang-format-7'
+    #    elif subprocess.call(['which', 'clang-format-8'], stdout=subprocess.PIPE) == 0:
+    #        CLANG_FORMAT_BIN = 'clang-format-8'
+    #    elif subprocess.call(['which', 'clang-format-9'], stdout=subprocess.PIPE) == 0:
+    #        CLANG_FORMAT_BIN = 'clang-format-9'
+    #    elif subprocess.call(['which', 'clang-format-10'], stdout=subprocess.PIPE) == 0:
+    #        CLANG_FORMAT_BIN = 'clang-format-10'
+    #    else:
+    #        print ("clang-format 7 or above is needed. Aborted.")
+    #        exit(1)
     else:
-        CLANG_FORMAT_BIN = 'clang-format'
+        CLANG_FORMAT_BIN = 'clang-format-10'
             
 COLUMN_LIMIT = 80
 for line in fmt.split("\n"):
@@ -65,8 +70,8 @@ def custom_format(filename):
     out = ""
     
     for line in src.split("\n"):
-        if line.startswith("#"):
-            if line.startswith("#define"):
+        if line.lstrip().startswith("#"):
+            if line[line.find("#")+1:].lstrip().startswith("define"):
                 in_define = True
         
         if "/*" in line and not line.strip().startswith("/*") and line.endswith("*/") and len(line) < (COLUMN_LIMIT-2):

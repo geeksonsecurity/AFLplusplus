@@ -1,11 +1,12 @@
 /*
 
-   american fuzzy lop - dislocator, an abusive allocator
+   american fuzzy lop++ - dislocator, an abusive allocator
    -----------------------------------------------------
 
-   Written by Michal Zalewski
+   Originally written by Michal Zalewski
 
    Copyright 2016 Google Inc. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -19,29 +20,77 @@
 
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <limits.h>
 #include <errno.h>
 #include <sys/mman.h>
 
 #ifdef __APPLE__
-#include <mach/vm_statistics.h>
+  #include <mach/vm_statistics.h>
+#endif
+
+#ifdef __FreeBSD__
+  #include <sys/param.h>
+#endif
+
+#if defined(__linux__) && !defined(__ANDROID__)
+  #include <unistd.h>
+  #include <sys/syscall.h>
+  #ifdef __NR_getrandom
+    #define arc4random_buf(p, l)                       \
+      do {                                             \
+                                                       \
+        ssize_t rd = syscall(__NR_getrandom, p, l, 0); \
+        if (rd != l) DEBUGF("getrandom failed");       \
+                                                       \
+      } while (0)
+
+  #else
+    #include <time.h>
+    #define arc4random_buf(p, l)     \
+      do {                           \
+                                     \
+        srand(time(NULL));           \
+        u32 i;                       \
+        u8 *ptr = (u8 *)p;           \
+        for (i = 0; i < l; i++)      \
+          ptr[i] = rand() % INT_MAX; \
+                                     \
+      } while (0)
+
+  #endif
 #endif
 
 #include "config.h"
 #include "types.h"
 
+#if __STDC_VERSION__ < 201112L || \
+    (defined(__FreeBSD__) && __FreeBSD_version < 1200000)
+// use this hack if not C11
+typedef struct {
+
+  long long   __ll;
+  long double __ld;
+
+} max_align_t;
+
+#endif
+
+#define ALLOC_ALIGN_SIZE (_Alignof(max_align_t))
+
 #ifndef PAGE_SIZE
-#define PAGE_SIZE 4096
+  #define PAGE_SIZE 4096
 #endif                                                        /* !PAGE_SIZE */
 
 #ifndef MAP_ANONYMOUS
-#define MAP_ANONYMOUS MAP_ANON
+  #define MAP_ANONYMOUS MAP_ANON
 #endif                                                    /* !MAP_ANONYMOUS */
 
-#define SUPER_PAGE_SIZE 1<<21
+#define SUPER_PAGE_SIZE 1 << 21
 
 /* Error / message handling: */
 
@@ -85,34 +134,38 @@
 #define ALLOC_CANARY 0xAACCAACC
 #define ALLOC_CLOBBER 0xCC
 
-#define PTR_C(_p) (((u32*)(_p))[-1])
-#define PTR_L(_p) (((u32*)(_p))[-2])
+#define TAIL_ALLOC_CANARY 0xAC
+
+#define PTR_C(_p) (((u32 *)(_p))[-1])
+#define PTR_L(_p) (((u32 *)(_p))[-2])
 
 /* Configurable stuff (use AFL_LD_* to set): */
 
 static u32 max_mem = MAX_ALLOC;         /* Max heap usage to permit         */
 static u8  alloc_verbose,               /* Additional debug messages        */
     hard_fail,                          /* abort() when max_mem exceeded?   */
-    no_calloc_over;                     /* abort() on calloc() overflows?   */
+    no_calloc_over,                     /* abort() on calloc() overflows?   */
+    align_allocations;                  /* Force alignment to sizeof(void*) */
 
-#if	defined	__OpenBSD__ || defined __APPLE__
-#define __thread
-#warning no thread support available
+#if defined __OpenBSD__ || defined __APPLE__
+  #define __thread
+  #warning no thread support available
 #endif
 static __thread size_t total_mem;       /* Currently allocated mem          */
 
 static __thread u32 call_depth;         /* To avoid recursion via fprintf() */
+static u32          alloc_canary;
 
 /* This is the main alloc function. It allocates one page more than necessary,
    sets that tailing page to PROT_NONE, and then increments the return address
    so that it is right-aligned to that boundary. Since it always uses mmap(),
    the returned memory will be zeroed. */
 
-static void* __dislocator_alloc(size_t len) {
+static void *__dislocator_alloc(size_t len) {
 
-  void* ret;
+  u8 *   ret;
   size_t tlen;
-  int flags, fd, sp;
+  int    flags, fd, sp;
 
   if (total_mem + len > max_mem || total_mem + len < total_mem) {
 
@@ -124,41 +177,48 @@ static void* __dislocator_alloc(size_t len) {
 
   }
 
-  tlen = (1 + PG_COUNT(len + 8)) * PAGE_SIZE;
-  flags = MAP_PRIVATE | MAP_ANONYMOUS;
-  fd = -1;
-#if defined(USEHUGEPAGE)
-  sp = (len >= SUPER_PAGE_SIZE && !(len % SUPER_PAGE_SIZE));
-
-#if defined(__APPLE__)
-  if (sp) fd = VM_FLAGS_SUPERPAGE_SIZE_2MB;
-#elif defined(__linux__)
-  if (sp) flags |= MAP_HUGETLB;
-#elif defined(__FreeBSD__)
-  if (sp) flags |= MAP_ALIGNED_SUPER;
-#endif
-#else
-  (void)sp;
-#endif
+  size_t rlen;
+  if (align_allocations && (len & (ALLOC_ALIGN_SIZE - 1)))
+    rlen = (len & ~(ALLOC_ALIGN_SIZE - 1)) + ALLOC_ALIGN_SIZE;
+  else
+    rlen = len;
 
   /* We will also store buffer length and a canary below the actual buffer, so
      let's add 8 bytes for that. */
 
-  ret = mmap(NULL, tlen, PROT_READ | PROT_WRITE,
-             flags, fd, 0);
+  tlen = (1 + PG_COUNT(rlen + 8)) * PAGE_SIZE;
+  flags = MAP_PRIVATE | MAP_ANONYMOUS;
+  fd = -1;
+#if defined(USEHUGEPAGE)
+  sp = (rlen >= SUPER_PAGE_SIZE && !(rlen % SUPER_PAGE_SIZE));
+
+  #if defined(__APPLE__)
+  if (sp) fd = VM_FLAGS_SUPERPAGE_SIZE_2MB;
+  #elif defined(__linux__)
+  if (sp) flags |= MAP_HUGETLB;
+  #elif defined(__FreeBSD__)
+  if (sp) flags |= MAP_ALIGNED_SUPER;
+  #endif
+#else
+  (void)sp;
+#endif
+
+  ret = (u8 *)mmap(NULL, tlen, PROT_READ | PROT_WRITE, flags, fd, 0);
 #if defined(USEHUGEPAGE)
   /* We try one more time with regular call */
   if (ret == MAP_FAILED) {
-#if defined(__APPLE__)
-  fd = -1;
-#elif defined(__linux__)
-  flags &= -MAP_HUGETLB;
-#elif defined(__FreeBSD__)
-  flags &= -MAP_ALIGNED_SUPER;
-#endif
-     ret = mmap(NULL, tlen, PROT_READ | PROT_WRITE,
-                flags, fd, 0);
+
+  #if defined(__APPLE__)
+    fd = -1;
+  #elif defined(__linux__)
+    flags &= -MAP_HUGETLB;
+  #elif defined(__FreeBSD__)
+    flags &= -MAP_ALIGNED_SUPER;
+  #endif
+    ret = (u8 *)mmap(NULL, tlen, PROT_READ | PROT_WRITE, flags, fd, 0);
+
   }
+
 #endif
 
   if (ret == MAP_FAILED) {
@@ -173,22 +233,30 @@ static void* __dislocator_alloc(size_t len) {
 
   /* Set PROT_NONE on the last page. */
 
-  if (mprotect(ret + PG_COUNT(len + 8) * PAGE_SIZE, PAGE_SIZE, PROT_NONE))
+  if (mprotect(ret + PG_COUNT(rlen + 8) * PAGE_SIZE, PAGE_SIZE, PROT_NONE))
     FATAL("mprotect() failed when allocating memory");
 
   /* Offset the return pointer so that it's right-aligned to the page
      boundary. */
 
-  ret += PAGE_SIZE * PG_COUNT(len + 8) - len - 8;
+  ret += PAGE_SIZE * PG_COUNT(rlen + 8) - rlen - 8;
 
   /* Store allocation metadata. */
 
   ret += 8;
 
   PTR_L(ret) = len;
-  PTR_C(ret) = ALLOC_CANARY;
+  PTR_C(ret) = alloc_canary;
 
   total_mem += len;
+
+  if (rlen != len) {
+
+    size_t i;
+    for (i = len; i < rlen; ++i)
+      ret[i] = TAIL_ALLOC_CANARY;
+
+  }
 
   return ret;
 
@@ -197,9 +265,9 @@ static void* __dislocator_alloc(size_t len) {
 /* The "user-facing" wrapper for calloc(). This just checks for overflows and
    displays debug messages if requested. */
 
-void* calloc(size_t elem_len, size_t elem_cnt) {
+void *calloc(size_t elem_len, size_t elem_cnt) {
 
-  void* ret;
+  void *ret;
 
   size_t len = elem_len * elem_cnt;
 
@@ -228,17 +296,13 @@ void* calloc(size_t elem_len, size_t elem_cnt) {
 
 }
 
-/* TODO: add a wrapper for posix_memalign, otherwise apps who use it,
-   will fail when freeing the memory.
-*/
-
 /* The wrapper for malloc(). Roughly the same, also clobbers the returned
    memory (unlike calloc(), malloc() is not guaranteed to return zeroed
    memory). */
 
-void* malloc(size_t len) {
+void *malloc(size_t len) {
 
-  void* ret;
+  void *ret;
 
   ret = __dislocator_alloc(len);
 
@@ -254,7 +318,7 @@ void* malloc(size_t len) {
    If the region is already freed, the code will segfault during the attempt to
    read the canary. Not very graceful, but works, right? */
 
-void free(void* ptr) {
+void free(void *ptr) {
 
   u32 len;
 
@@ -262,11 +326,21 @@ void free(void* ptr) {
 
   if (!ptr) return;
 
-  if (PTR_C(ptr) != ALLOC_CANARY) FATAL("bad allocator canary on free()");
+  if (PTR_C(ptr) != alloc_canary) FATAL("bad allocator canary on free()");
 
   len = PTR_L(ptr);
 
   total_mem -= len;
+
+  if (align_allocations && (len & (ALLOC_ALIGN_SIZE - 1))) {
+
+    u8 *   ptr_ = ptr;
+    size_t rlen = (len & ~(ALLOC_ALIGN_SIZE - 1)) + ALLOC_ALIGN_SIZE;
+    for (; len < rlen; ++len)
+      if (ptr_[len] != TAIL_ALLOC_CANARY)
+        FATAL("bad tail allocator canary on free()");
+
+  }
 
   /* Protect everything. Note that the extra page at the end is already
      set as PROT_NONE, so we don't need to touch that. */
@@ -283,15 +357,16 @@ void free(void* ptr) {
 /* Realloc is pretty straightforward, too. We forcibly reallocate the buffer,
    move data, and then free (aka mprotect()) the original one. */
 
-void* realloc(void* ptr, size_t len) {
+void *realloc(void *ptr, size_t len) {
 
-  void* ret;
+  void *ret;
 
   ret = malloc(len);
 
   if (ret && ptr) {
 
-    if (PTR_C(ptr) != ALLOC_CANARY) FATAL("bad allocator canary on realloc()");
+    if (PTR_C(ptr) != alloc_canary) FATAL("bad allocator canary on realloc()");
+    // Here the tail canary check is delayed to free()
 
     memcpy(ret, ptr, MIN(len, PTR_L(ptr)));
     free(ptr);
@@ -308,64 +383,148 @@ void* realloc(void* ptr, size_t len) {
    if the requested size fits within the alignment we do
    a normal request */
 
-int posix_memalign(void** ptr, size_t align, size_t len) {
-   if (*ptr == NULL) 
-     return EINVAL;
-   if ((align % 2) || (align % sizeof(void *)))
-     return EINVAL;
-   if (len == 0) {
-     *ptr = NULL;
-     return 0;
-   }
-   if (align >= 4 * sizeof(size_t)) len += align -1;
+int posix_memalign(void **ptr, size_t align, size_t len) {
 
-   *ptr = malloc(len);
+  // if (*ptr == NULL) return EINVAL; // (andrea) Why? I comment it out for now
+  if ((align % 2) || (align % sizeof(void *))) return EINVAL;
+  if (len == 0) {
 
-   DEBUGF("posix_memalign(%p %zu, %zu)", ptr, align, len);
+    *ptr = NULL;
+    return 0;
 
-   return 0;
+  }
+
+  size_t rem = len % align;
+  if (rem) len += align - rem;
+
+  *ptr = __dislocator_alloc(len);
+
+  if (*ptr && len) memset(*ptr, ALLOC_CLOBBER, len);
+
+  DEBUGF("posix_memalign(%p %zu, %zu) [*ptr = %p]", ptr, align, len, *ptr);
+
+  return 0;
+
 }
 
 /* just the non-posix fashion */
 
 void *memalign(size_t align, size_t len) {
-   void* ret = NULL;
 
-   if (posix_memalign(&ret, align, len)) {
-     DEBUGF("memalign(%zu, %zu) failed", align, len);
-   }
+  void *ret = NULL;
 
-   return ret;
+  if (posix_memalign(&ret, align, len)) {
+
+    DEBUGF("memalign(%zu, %zu) failed", align, len);
+
+  }
+
+  return ret;
+
 }
 
 /* sort of C11 alias of memalign only more severe, alignment-wise */
 
 void *aligned_alloc(size_t align, size_t len) {
-   void *ret = NULL;
 
-   if ((len % align)) return NULL;
+  void *ret = NULL;
 
-   if (posix_memalign(&ret, align, len)) {
-     DEBUGF("aligned_alloc(%zu, %zu) failed", align, len);
-   }
+  if ((len % align)) return NULL;
 
-   return ret;
+  if (posix_memalign(&ret, align, len)) {
+
+    DEBUGF("aligned_alloc(%zu, %zu) failed", align, len);
+
+  }
+
+  return ret;
+
+}
+
+/* specific BSD api mainly checking possible overflow for the size */
+
+void *reallocarray(void *ptr, size_t elem_len, size_t elem_cnt) {
+
+  const size_t elem_lim = 1UL << (sizeof(size_t) * 4);
+  const size_t elem_tot = elem_len * elem_cnt;
+  void *       ret = NULL;
+
+  if ((elem_len >= elem_lim || elem_cnt >= elem_lim) && elem_len > 0 &&
+      elem_cnt > (SIZE_MAX / elem_len)) {
+
+    DEBUGF("reallocarray size overflow (%zu)", elem_tot);
+
+  } else {
+
+    ret = realloc(ptr, elem_tot);
+
+  }
+
+  return ret;
+
+}
+
+#if !defined(__ANDROID__)
+size_t malloc_usable_size(void *ptr) {
+
+#else
+size_t malloc_usable_size(const void *ptr) {
+
+#endif
+
+  return ptr ? PTR_L(ptr) : 0;
+
 }
 
 __attribute__((constructor)) void __dislocator_init(void) {
 
-  u8* tmp = (u8 *)getenv("AFL_LD_LIMIT_MB");
+  u8 *tmp = (u8 *)getenv("AFL_LD_LIMIT_MB");
 
   if (tmp) {
 
-    max_mem = atoi((char *)tmp) * 1024 * 1024;
-    if (!max_mem) FATAL("Bad value for AFL_LD_LIMIT_MB");
+    u8 *tok;
+    s32 mmem = (s32)strtol((char *)tmp, (char **)&tok, 10);
+    if (*tok != '\0' || errno == ERANGE) FATAL("Bad value for AFL_LD_LIMIT_MB");
+    max_mem = mmem * 1024 * 1024;
 
   }
+
+  alloc_canary = ALLOC_CANARY;
+  tmp = (u8 *)getenv("AFL_RANDOM_ALLOC_CANARY");
+
+  if (tmp) arc4random_buf(&alloc_canary, sizeof(alloc_canary));
 
   alloc_verbose = !!getenv("AFL_LD_VERBOSE");
   hard_fail = !!getenv("AFL_LD_HARD_FAIL");
   no_calloc_over = !!getenv("AFL_LD_NO_CALLOC_OVER");
+  align_allocations = !!getenv("AFL_ALIGNED_ALLOC");
+
+}
+
+/* NetBSD fault handler specific api subset */
+
+void (*esetfunc(void (*fn)(int, const char *, ...)))(int, const char *, ...) {
+
+  /* Might not be meaningful to implement; upper calls already report errors */
+  return NULL;
+
+}
+
+void *emalloc(size_t len) {
+
+  return malloc(len);
+
+}
+
+void *ecalloc(size_t elem_len, size_t elem_cnt) {
+
+  return calloc(elem_len, elem_cnt);
+
+}
+
+void *erealloc(void *ptr, size_t len) {
+
+  return realloc(ptr, len);
 
 }
 

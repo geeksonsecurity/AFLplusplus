@@ -1,5 +1,5 @@
 /*
-   american fuzzy lop - GCC wrapper for GCC plugin
+   american fuzzy lop++ - GCC wrapper for GCC plugin
    ------------------------------------------------
 
    Written by Austin Seipp <aseipp@pobox.com> and
@@ -26,25 +26,27 @@
 
 #define AFL_MAIN
 
-#include "../config.h"
-#include "../types.h"
-#include "../include/debug.h"
-#include "../include/alloc-inl.h"
+#include "config.h"
+#include "types.h"
+#include "debug.h"
+#include "common.h"
+#include "alloc-inl.h"
 
 #include <stdio.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 
-static u8*  obj_path;                  /* Path to runtime libraries         */
-static u8** cc_params;                 /* Parameters passed to the real CC  */
+static u8 * obj_path;                  /* Path to runtime libraries         */
+static u8 **cc_params;                 /* Parameters passed to the real CC  */
 static u32  cc_par_cnt = 1;            /* Param count, including argv0      */
+u8          use_stdin = 0;                                         /* dummy */
 
 /* Try to find the runtime libraries. If that fails, abort. */
 
-static void find_obj(u8* argv0) {
+static void find_obj(u8 *argv0) {
 
-  u8* afl_path = getenv("AFL_PATH");
+  u8 *afl_path = getenv("AFL_PATH");
   u8 *slash, *tmp;
 
   if (afl_path) {
@@ -67,7 +69,7 @@ static void find_obj(u8* argv0) {
 
   if (slash) {
 
-    u8* dir;
+    u8 *dir;
 
     *slash = 0;
     dir = ck_strdup(argv0);
@@ -103,12 +105,12 @@ static void find_obj(u8* argv0) {
 
 /* Copy argv to cc_params, making the necessary edits. */
 
-static void edit_params(u32 argc, char** argv) {
+static void edit_params(u32 argc, char **argv) {
 
   u8  fortify_set = 0, asan_set = 0, x_set = 0, maybe_linking = 1;
-  u8* name;
+  u8 *name;
 
-  cc_params = ck_alloc((argc + 128) * sizeof(u8*));
+  cc_params = ck_alloc((argc + 128) * sizeof(u8 *));
 
   name = strrchr(argv[0], '/');
   if (!name)
@@ -118,17 +120,23 @@ static void edit_params(u32 argc, char** argv) {
 
   if (!strcmp(name, "afl-g++-fast")) {
 
-    u8* alt_cxx = getenv("AFL_CXX");
-    cc_params[0] = alt_cxx ? alt_cxx : (u8*)AFL_GCC_CXX;
+    u8 *alt_cxx = getenv("AFL_CXX");
+    cc_params[0] = alt_cxx && *alt_cxx ? alt_cxx : (u8 *)AFL_GCC_CXX;
+
+  } else if (!strcmp(name, "afl-gcc-fast")) {
+
+    u8 *alt_cc = getenv("AFL_CC");
+    cc_params[0] = alt_cc && *alt_cc ? alt_cc : (u8 *)AFL_GCC_CC;
 
   } else {
 
-    u8* alt_cc = getenv("AFL_CC");
-    cc_params[0] = alt_cc ? alt_cc : (u8*)AFL_GCC_CC;
+    fprintf(stderr, "Name of the binary: %s\n", argv[0]);
+    FATAL(
+        "Name of the binary is not a known name, expected afl-(gcc|g++)-fast");
 
   }
 
-  char* fplugin_arg = alloc_printf("-fplugin=%s/afl-gcc-pass.so", obj_path);
+  char *fplugin_arg = alloc_printf("-fplugin=%s/afl-gcc-pass.so", obj_path);
   cc_params[cc_par_cnt++] = fplugin_arg;
 
   /* Detect stray -v calls from ./configure scripts. */
@@ -137,7 +145,7 @@ static void edit_params(u32 argc, char** argv) {
 
   while (--argc) {
 
-    u8* cur = *(++argv);
+    u8 *cur = *(++argv);
 
 #if defined(__x86_64__)
     if (!strcmp(cur, "-m32")) FATAL("-m32 is not supported");
@@ -191,6 +199,14 @@ static void edit_params(u32 argc, char** argv) {
       cc_params[cc_par_cnt++] = "-fsanitize=memory";
 
     }
+
+  }
+
+  if (getenv("AFL_USE_UBSAN")) {
+
+    cc_params[cc_par_cnt++] = "-fsanitize=undefined";
+    cc_params[cc_par_cnt++] = "-fsanitize-undefined-trap-on-error";
+    cc_params[cc_par_cnt++] = "-fno-sanitize-recover=all";
 
   }
 
@@ -286,7 +302,7 @@ static void edit_params(u32 argc, char** argv) {
 
 /* Main entry point */
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv, char **envp) {
 
   if (argc < 2 || strcmp(argv[1], "-h") == 0) {
 
@@ -313,19 +329,58 @@ int main(int argc, char** argv) {
         "programs\n"
         "(similarly to the LLVM plugin used by afl-clang-fast).\n\n"
 
-        "You can specify custom next-stage toolchain via AFL_CC and AFL_CXX. "
-        "Setting\n"
-        "AFL_HARDEN enables hardening optimizations in the compiled code.\n\n",
-        BIN_PATH, BIN_PATH);
+        "Environment variables used:\n"
+        "AFL_CC: path to the C compiler to use\n"
+        "AFL_CXX: path to the C++ compiler to use\n"
+        "AFL_PATH: path to instrumenting pass and runtime (afl-gcc-rt.*o)\n"
+        "AFL_DONT_OPTIMIZE: disable optimization instead of -O3\n"
+        "AFL_NO_BUILTIN: compile for use with libtokencap.so\n"
+        "AFL_INST_RATIO: percentage of branches to instrument\n"
+        "AFL_QUIET: suppress verbose output\n"
+        "AFL_DEBUG: enable developer debugging output\n"
+        "AFL_HARDEN: adds code hardening to catch memory bugs\n"
+        "AFL_USE_ASAN: activate address sanitizer\n"
+        "AFL_USE_MSAN: activate memory sanitizer\n"
+        "AFL_USE_UBSAN: activate undefined behaviour sanitizer\n"
+        "AFL_GCC_WHITELIST: enable whitelisting (selective instrumentation)\n"
+
+        "\nafl-gcc-fast was built for gcc %s with the gcc binary path of "
+        "\"%s\".\n\n",
+        BIN_PATH, BIN_PATH, GCC_VERSION, GCC_BINDIR);
 
     exit(1);
 
-  } else if (isatty(2) && !getenv("AFL_QUIET")) {
+  } else if ((isatty(2) && !getenv("AFL_QUIET")) ||
+
+             getenv("AFL_DEBUG") != NULL) {
 
     SAYF(cCYA "afl-gcc-fast" VERSION cRST
               " initially by <aseipp@pobox.com>, maintainer: hexcoder-\n");
 
+    if (getenv("AFL_GCC_WHITELIST") == NULL) {
+
+      SAYF(cYEL "Warning:" cRST
+                " using afl-gcc-fast without using AFL_GCC_WHITELIST currently "
+                "produces worse results than afl-gcc. Even better, use "
+                "llvm_mode for now.\n");
+
+    }
+
+  } else
+
+    be_quiet = 1;
+
+  u8 *ptr;
+  if (!be_quiet &&
+      ((ptr = getenv("AFL_MAP_SIZE")) || (ptr = getenv("AFL_MAPSIZE")))) {
+
+    u32 map_size = atoi(ptr);
+    if (map_size != MAP_SIZE)
+      FATAL("AFL_MAP_SIZE is not supported by afl-gcc-fast");
+
   }
+
+  check_environment_vars(envp);
 
   find_obj(argv[0]);
 
@@ -338,7 +393,7 @@ int main(int argc, char** argv) {
     }
 
   */
-  execvp(cc_params[0], (char**)cc_params);
+  execvp(cc_params[0], (char **)cc_params);
 
   FATAL("Oops, failed to execute '%s' - check your PATH", cc_params[0]);
 

@@ -6,12 +6,13 @@
 
    Forkserver design by Jann Horn <jannhorn@googlemail.com>
 
-   Now maintained by by Marc Heuse <mh@mh-sec.de>,
+   Now maintained by Marc Heuse <mh@mh-sec.de>,
                         Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
-                        Andrea Fioraldi <andreafioraldi@gmail.com>
+                        Andrea Fioraldi <andreafioraldi@gmail.com> and
+                        Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -29,7 +30,7 @@
 #define AFL_MAIN
 
 #ifdef __ANDROID__
-#include "android-ashmem.h"
+  #include "android-ashmem.h"
 #endif
 
 #include "config.h"
@@ -58,55 +59,31 @@
 #include <sys/types.h>
 #include <sys/resource.h>
 
-s32 forksrv_pid,                        /* PID of the fork server           */
-    child_pid;                          /* PID of the tested program        */
+static u8 *mask_bitmap;                /* Mask for trace bits (-B)          */
 
-s32 fsrv_ctl_fd,                        /* Fork server control pipe (write) */
-    fsrv_st_fd;                         /* Fork server status pipe (read)   */
+static u8 *in_file,                    /* Minimizer input test case         */
+    *out_file, *output_file;           /* Minimizer output file             */
 
-u8*        trace_bits;                 /* SHM with instrumentation bitmap   */
-static u8* mask_bitmap;                /* Mask for trace bits (-B)          */
-
-u8 *in_file,                           /* Minimizer input test case         */
-    *output_file,                      /* Minimizer output file             */
-    *out_file,                         /* Targeted program input file       */
-    *doc_path;                         /* Path to docs                      */
-
-s32 out_fd;                           /* Persistent fd for out_file         */
-
-static u8* in_data;                    /* Input data for trimming           */
+static u8 *in_data;                    /* Input data for trimming           */
 
 static u32 in_len,                     /* Input data length                 */
     orig_cksum,                        /* Original checksum                 */
-    total_execs,                       /* Total number of execs             */
     missed_hangs,                      /* Misses due to hangs               */
     missed_crashes,                    /* Misses due to crashes             */
-    missed_paths;                      /* Misses due to exec path diffs     */
-u32 exec_tmout = EXEC_TIMEOUT;         /* Exec timeout (ms)                 */
-
-u64 mem_limit = MEM_LIMIT;             /* Memory limit (MB)                 */
-
-s32 dev_null_fd = -1;                  /* FD to /dev/null                   */
+    missed_paths,                      /* Misses due to exec path diffs     */
+    map_size = MAP_SIZE;
 
 static u8 crash_mode,                  /* Crash-centric mode?               */
+    hang_mode,                         /* Minimize as long as it hangs      */
     exit_crash,                        /* Treat non-zero exit as crash?     */
     edges_only,                        /* Ignore hit counts?                */
-    exact_mode,                        /* Require path match for crashes?   */
-    use_stdin = 1;                     /* Use stdin for program input?      */
+    exact_mode;                        /* Require path match for crashes?   */
 
 static volatile u8 stop_soon;          /* Ctrl-C pressed?                   */
 
 /*
  * forkserver section
  */
-
-/* we only need this to use afl-forkserver */
-FILE* plot_file;
-u8    uses_asan;
-s32   out_fd = -1, out_dir_fd = -1, dev_urandom_fd = -1;
-
-/* we import this as we need this information */
-extern u8 child_timed_out;
 
 /* Classify tuple counts. This is a slow & naive version, but good enough here.
  */
@@ -125,15 +102,34 @@ static const u8 count_class_lookup[256] = {
 
 };
 
-static void classify_counts(u8* mem) {
+/* Apply mask to classified bitmap (if set). */
 
-  u32 i = MAP_SIZE;
+static void apply_mask(u32 *mem, u32 *mask) {
+
+  u32 i = (map_size >> 2);
+
+  if (!mask) { return; }
+
+  while (i--) {
+
+    *mem &= ~*mask;
+    mem++;
+    mask++;
+
+  }
+
+}
+
+static void classify_counts(afl_forkserver_t *fsrv) {
+
+  u8 *mem = fsrv->trace_bits;
+  u32 i = map_size;
 
   if (edges_only) {
 
     while (i--) {
 
-      if (*mem) *mem = 1;
+      if (*mem) { *mem = 1; }
       mem++;
 
     }
@@ -151,43 +147,26 @@ static void classify_counts(u8* mem) {
 
 }
 
-/* Apply mask to classified bitmap (if set). */
+/* See if any bytes are set in the bitmap. */
 
-static void apply_mask(u32* mem, u32* mask) {
+static inline u8 anything_set(afl_forkserver_t *fsrv) {
 
-  u32 i = (MAP_SIZE >> 2);
-
-  if (!mask) return;
+  u32 *ptr = (u32 *)fsrv->trace_bits;
+  u32  i = (map_size >> 2);
 
   while (i--) {
 
-    *mem &= ~*mask;
-    mem++;
-    mask++;
+    if (*(ptr++)) { return 1; }
 
   }
-
-}
-
-/* See if any bytes are set in the bitmap. */
-
-static inline u8 anything_set(void) {
-
-  u32* ptr = (u32*)trace_bits;
-  u32  i = (MAP_SIZE >> 2);
-
-  while (i--)
-    if (*(ptr++)) return 1;
 
   return 0;
 
 }
 
-/* Get rid of temp files (atexit handler). */
-
 static void at_exit_handler(void) {
 
-  if (out_file) unlink(out_file);                          /* Ignore errors */
+  afl_fsrv_killall();
 
 }
 
@@ -198,12 +177,15 @@ static void read_initial_file(void) {
   struct stat st;
   s32         fd = open(in_file, O_RDONLY);
 
-  if (fd < 0) PFATAL("Unable to open '%s'", in_file);
+  if (fd < 0) { PFATAL("Unable to open '%s'", in_file); }
 
-  if (fstat(fd, &st) || !st.st_size) FATAL("Zero-sized input file.");
+  if (fstat(fd, &st) || !st.st_size) { FATAL("Zero-sized input file."); }
 
-  if (st.st_size >= TMIN_MAX_FILE)
+  if (st.st_size >= TMIN_MAX_FILE) {
+
     FATAL("Input file is too large (%u MB max)", TMIN_MAX_FILE / 1024 / 1024);
+
+  }
 
   in_len = st.st_size;
   in_data = ck_alloc_nozero(in_len);
@@ -218,7 +200,7 @@ static void read_initial_file(void) {
 
 /* Write output file. */
 
-static s32 write_to_file(u8* path, u8* mem, u32 len) {
+static s32 write_to_file(u8 *path, u8 *mem, u32 len) {
 
   s32 ret;
 
@@ -226,7 +208,7 @@ static s32 write_to_file(u8* path, u8* mem, u32 len) {
 
   ret = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
 
-  if (ret < 0) PFATAL("Unable to create '%s'", path);
+  if (ret < 0) { PFATAL("Unable to create '%s'", path); }
 
   ck_write(ret, mem, len, path);
 
@@ -236,255 +218,18 @@ static s32 write_to_file(u8* path, u8* mem, u32 len) {
 
 }
 
-/* Write modified data to file for testing. If use_stdin is clear, the old file
-   is unlinked and a new one is created. Otherwise, out_fd is rewound and
-   truncated. */
-
-static void write_to_testcase(void* mem, u32 len) {
-
-  s32 fd = out_fd;
-
-  if (!use_stdin) {
-
-    unlink(out_file);                                     /* Ignore errors. */
-
-    fd = open(out_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
-
-    if (fd < 0) PFATAL("Unable to create '%s'", out_file);
-
-  } else
-
-    lseek(fd, 0, SEEK_SET);
-
-  ck_write(fd, mem, len, out_file);
-
-  if (use_stdin) {
-
-    if (ftruncate(fd, len)) PFATAL("ftruncate() failed");
-    lseek(fd, 0, SEEK_SET);
-
-  } else
-
-    close(fd);
-
-}
-
-/* Handle timeout signal. */
-/*
-static void handle_timeout(int sig) {
-
-  if (child_pid > 0) {
-
-  child_timed_out = 1;
-    kill(child_pid, SIGKILL);
-
-  } else if (child_pid == -1 && forksrv_pid > 0) {
-
-    child_timed_out = 1;
-    kill(forksrv_pid, SIGKILL);
-
-  }
-
-}
-
-*/
-
-/* start the app and it's forkserver */
-/*
-static void init_forkserver(char **argv) {
-
-  static struct itimerval it;
-  int st_pipe[2], ctl_pipe[2];
-  int status = 0;
-  s32 rlen;
-
-  ACTF("Spinning up the fork server...");
-  if (pipe(st_pipe) || pipe(ctl_pipe)) PFATAL("pipe() failed");
-
-  forksrv_pid = fork();
-
-  if (forksrv_pid < 0) PFATAL("fork() failed");
-
-  if (!forksrv_pid) {
-
-    struct rlimit r;
-
-    if (dup2(use_stdin ? out_fd : dev_null_fd, 0) < 0 ||
-        dup2(dev_null_fd, 1) < 0 ||
-        dup2(dev_null_fd, 2) < 0) {
-
-      *(u32*)trace_bits = EXEC_FAIL_SIG;
-      PFATAL("dup2() failed");
-
-    }
-
-    close(dev_null_fd);
-    close(out_fd);
-
-    setsid();
-
-    if (mem_limit) {
-
-      r.rlim_max = r.rlim_cur = ((rlim_t)mem_limit) << 20;
-
-#ifdef RLIMIT_AS
-
-      setrlimit(RLIMIT_AS, &r); // Ignore errors
-
-#else
-
-      setrlimit(RLIMIT_DATA, &r); // Ignore errors
-
-#endif // ^RLIMIT_AS
-
-    }
-
-    r.rlim_max = r.rlim_cur = 0;
-    setrlimit(RLIMIT_CORE, &r); // Ignore errors
-
-    // Set up control and status pipes, close the unneeded original fds.
-
-    if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
-    if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");
-
-    close(ctl_pipe[0]);
-    close(ctl_pipe[1]);
-    close(st_pipe[0]);
-    close(st_pipe[1]);
-
-    execv(target_path, argv);
-
-    *(u32*)trace_bits = EXEC_FAIL_SIG;
-    exit(0);
-
-  }
-
-  // Close the unneeded endpoints.
-
-  close(ctl_pipe[0]);
-  close(st_pipe[1]);
-
-  fsrv_ctl_fd = ctl_pipe[1];
-  fsrv_st_fd  = st_pipe[0];
-
-  // Configure timeout, wait for child, cancel timeout.
-
-  if (exec_tmout) {
-
-    child_timed_out = 0;
-    it.it_value.tv_sec = (exec_tmout * FORK_WAIT_MULT / 1000);
-    it.it_value.tv_usec = ((exec_tmout * FORK_WAIT_MULT) % 1000) * 1000;
-
-  }
-
-  setitimer(ITIMER_REAL, &it, NULL);
-
-  rlen = read(fsrv_st_fd, &status, 4);
-
-  it.it_value.tv_sec = 0;
-  it.it_value.tv_usec = 0;
-  setitimer(ITIMER_REAL, &it, NULL);
-
-  // If we have a four-byte "hello" message from the server, we're all set.
-  // Otherwise, try to figure out what went wrong.
-
-  if (rlen == 4) {
-
-    ACTF("All right - fork server is up.");
-    return;
-
-  }
-
-  if (waitpid(forksrv_pid, &status, 0) <= 0)
-    PFATAL("waitpid() failed");
-
-  u8 child_crashed;
-
-  if (WIFSIGNALED(status))
-    child_crashed = 1;
-
-  if (child_timed_out)
-    SAYF(cLRD "\n+++ Program timed off +++\n" cRST);
-  else if (stop_soon)
-    SAYF(cLRD "\n+++ Program aborted by user +++\n" cRST);
-  else if (child_crashed)
-    SAYF(cLRD "\n+++ Program killed by signal %u +++\n" cRST, WTERMSIG(status));
-
-}
-
-*/
-
 /* Execute target application. Returns 0 if the changes are a dud, or
    1 if they should be kept. */
 
-static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
+static u8 tmin_run_target(afl_forkserver_t *fsrv, char **argv, u8 *mem, u32 len,
+                          u8 first_run) {
 
-  static struct itimerval it;
-  static u32              prev_timed_out = 0;
-  int                     status = 0;
+  afl_fsrv_write_to_testcase(fsrv, mem, len);
 
-  u32 cksum;
+  fsrv_run_result_t ret =
+      afl_fsrv_run_target(fsrv, fsrv->exec_tmout, &stop_soon);
 
-  memset(trace_bits, 0, MAP_SIZE);
-  MEM_BARRIER();
-
-  write_to_testcase(mem, len);
-
-  s32 res;
-
-  /* we have the fork server up and running, so simply
-     tell it to have at it, and then read back PID. */
-
-  if ((res = write(fsrv_ctl_fd, &prev_timed_out, 4)) != 4) {
-
-    if (stop_soon) return 0;
-    RPFATAL(res, "Unable to request new process from fork server (OOM?)");
-
-  }
-
-  if ((res = read(fsrv_st_fd, &child_pid, 4)) != 4) {
-
-    if (stop_soon) return 0;
-    RPFATAL(res, "Unable to request new process from fork server (OOM?)");
-
-  }
-
-  if (child_pid <= 0) FATAL("Fork server is misbehaving (OOM?)");
-
-  /* Configure timeout, wait for child, cancel timeout. */
-
-  if (exec_tmout) {
-
-    it.it_value.tv_sec = (exec_tmout / 1000);
-    it.it_value.tv_usec = (exec_tmout % 1000) * 1000;
-
-  }
-
-  setitimer(ITIMER_REAL, &it, NULL);
-
-  if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
-
-    if (stop_soon) return 0;
-    RPFATAL(res, "Unable to communicate with fork server (OOM?)");
-
-  }
-
-  child_pid = 0;
-  it.it_value.tv_sec = 0;
-  it.it_value.tv_usec = 0;
-
-  setitimer(ITIMER_REAL, &it, NULL);
-
-  MEM_BARRIER();
-
-  /* Clean up bitmap, analyze exit condition, etc. */
-
-  if (*(u32*)trace_bits == EXEC_FAIL_SIG)
-    FATAL("Unable to execute '%s'", argv[0]);
-
-  classify_counts(trace_bits);
-  apply_mask((u32*)trace_bits, (u32*)mask_bitmap);
-  total_execs++;
+  if (ret == FSRV_RUN_ERROR) { FATAL("Couldn't run child"); }
 
   if (stop_soon) {
 
@@ -494,9 +239,29 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
 
   }
 
-  /* Always discard inputs that time out. */
+  /* Always discard inputs that time out, unless we are in hang mode */
 
-  if (child_timed_out) {
+  if (hang_mode) {
+
+    switch (ret) {
+
+      case FSRV_RUN_TMOUT:
+        return 1;
+      case FSRV_RUN_CRASH:
+        missed_crashes++;
+        return 0;
+      default:
+        missed_hangs++;
+        return 0;
+
+    }
+
+  }
+
+  classify_counts(fsrv);
+  apply_mask((u32 *)fsrv->trace_bits, (u32 *)mask_bitmap);
+
+  if (ret == FSRV_RUN_TMOUT) {
 
     missed_hangs++;
     return 0;
@@ -505,15 +270,13 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
 
   /* Handle crashing inputs depending on current mode. */
 
-  if (WIFSIGNALED(status) ||
-      (WIFEXITED(status) && WEXITSTATUS(status) == MSAN_ERROR) ||
-      (WIFEXITED(status) && WEXITSTATUS(status) && exit_crash)) {
+  if (ret == FSRV_RUN_CRASH) {
 
-    if (first_run) crash_mode = 1;
+    if (first_run) { crash_mode = 1; }
 
     if (crash_mode) {
 
-      if (!exact_mode) return 1;
+      if (!exact_mode) { return 1; }
 
     } else {
 
@@ -522,46 +285,39 @@ static u8 run_target(char** argv, u8* mem, u32 len, u8 first_run) {
 
     }
 
-  } else
+  } else {
 
-      /* Handle non-crashing inputs appropriately. */
+    /* Handle non-crashing inputs appropriately. */
 
-      if (crash_mode) {
+    if (crash_mode) {
 
-    missed_paths++;
-    return 0;
+      missed_paths++;
+      return 0;
+
+    }
 
   }
 
-  cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+  if (ret == FSRV_RUN_NOINST) { FATAL("Binary not instrumented?"); }
 
-  if (first_run) orig_cksum = cksum;
+  u32 cksum = hash32(fsrv->trace_bits, fsrv->map_size, HASH_CONST);
 
-  if (orig_cksum == cksum) return 1;
+  if (first_run) { orig_cksum = cksum; }
+
+  if (orig_cksum == cksum) { return 1; }
 
   missed_paths++;
   return 0;
 
 }
 
-/* Find first power of two greater or equal to val. */
-
-static u32 next_p2(u32 val) {
-
-  u32 ret = 1;
-  while (val > ret)
-    ret <<= 1;
-  return ret;
-
-}
-
 /* Actually minimize! */
 
-static void minimize(char** argv) {
+static void minimize(afl_forkserver_t *fsrv, char **argv) {
 
   static u32 alpha_map[256];
 
-  u8* tmp_buf = ck_alloc_nozero(in_len);
+  u8 *tmp_buf = ck_alloc_nozero(in_len);
   u32 orig_len = in_len, stage_o_len;
 
   u32 del_len, set_len, del_pos, set_pos, i, alpha_size, cur_pass = 0;
@@ -572,10 +328,10 @@ static void minimize(char** argv) {
    * BLOCK NORMALIZATION *
    ***********************/
 
-  set_len = next_p2(in_len / TMIN_SET_STEPS);
+  set_len = next_pow2(in_len / TMIN_SET_STEPS);
   set_pos = 0;
 
-  if (set_len < TMIN_SET_MIN_SIZE) set_len = TMIN_SET_MIN_SIZE;
+  if (set_len < TMIN_SET_MIN_SIZE) { set_len = TMIN_SET_MIN_SIZE; }
 
   ACTF(cBRI "Stage #0: " cRST "One-time block normalization...");
 
@@ -583,8 +339,11 @@ static void minimize(char** argv) {
 
     u32 use_len = MIN(set_len, in_len - set_pos);
 
-    for (i = 0; i < use_len; i++)
-      if (in_data[set_pos + i] != '0') break;
+    for (i = 0; i < use_len; i++) {
+
+      if (in_data[set_pos + i] != '0') { break; }
+
+    }
 
     if (i != use_len) {
 
@@ -592,7 +351,7 @@ static void minimize(char** argv) {
       memset(tmp_buf + set_pos, '0', use_len);
 
       u8 res;
-      res = run_target(argv, tmp_buf, in_len, 0);
+      res = tmin_run_target(fsrv, argv, tmp_buf, in_len, 0);
 
       if (res) {
 
@@ -622,14 +381,14 @@ next_pass:
    * BLOCK DELETION *
    ******************/
 
-  del_len = next_p2(in_len / TRIM_START_STEPS);
+  del_len = next_pow2(in_len / TRIM_START_STEPS);
   stage_o_len = in_len;
 
   ACTF(cBRI "Stage #1: " cRST "Removing blocks of data...");
 
 next_del_blksize:
 
-  if (!del_len) del_len = 1;
+  if (!del_len) { del_len = 1; }
   del_pos = 0;
   prev_del = 1;
 
@@ -642,7 +401,7 @@ next_del_blksize:
     s32 tail_len;
 
     tail_len = in_len - del_pos - del_len;
-    if (tail_len < 0) tail_len = 0;
+    if (tail_len < 0) { tail_len = 0; }
 
     /* If we have processed at least one full block (initially, prev_del == 1),
        and we did so without deleting the previous one, and we aren't at the
@@ -665,7 +424,7 @@ next_del_blksize:
     /* Tail */
     memcpy(tmp_buf + del_pos, in_data + del_pos + del_len, tail_len);
 
-    res = run_target(argv, tmp_buf, del_pos + tail_len, 0);
+    res = tmin_run_target(fsrv, argv, tmp_buf, del_pos + tail_len, 0);
 
     if (res) {
 
@@ -675,9 +434,11 @@ next_del_blksize:
 
       changed_any = 1;
 
-    } else
+    } else {
 
       del_pos += del_len;
+
+    }
 
   }
 
@@ -690,11 +451,14 @@ next_del_blksize:
 
   OKF("Block removal complete, %u bytes deleted.", stage_o_len - in_len);
 
-  if (!in_len && changed_any)
+  if (!in_len && changed_any) {
+
     WARNF(cLRD
           "Down to zero bytes - check the command line and mem limit!" cRST);
 
-  if (cur_pass > 1 && !changed_any) goto finalize_all;
+  }
+
+  if (cur_pass > 1 && !changed_any) { goto finalize_all; }
 
   /*************************
    * ALPHABET MINIMIZATION *
@@ -708,7 +472,7 @@ next_del_blksize:
 
   for (i = 0; i < in_len; i++) {
 
-    if (!alpha_map[in_data[i]]) alpha_size++;
+    if (!alpha_map[in_data[i]]) { alpha_size++; }
     alpha_map[in_data[i]]++;
 
   }
@@ -721,14 +485,17 @@ next_del_blksize:
     u32 r;
     u8  res;
 
-    if (i == '0' || !alpha_map[i]) continue;
+    if (i == '0' || !alpha_map[i]) { continue; }
 
     memcpy(tmp_buf, in_data, in_len);
 
-    for (r = 0; r < in_len; r++)
-      if (tmp_buf[r] == i) tmp_buf[r] = '0';
+    for (r = 0; r < in_len; r++) {
 
-    res = run_target(argv, tmp_buf, in_len, 0);
+      if (tmp_buf[r] == i) { tmp_buf[r] = '0'; }
+
+    }
+
+    res = tmin_run_target(fsrv, argv, tmp_buf, in_len, 0);
 
     if (res) {
 
@@ -761,10 +528,10 @@ next_del_blksize:
 
     u8 res, orig = tmp_buf[i];
 
-    if (orig == '0') continue;
+    if (orig == '0') { continue; }
     tmp_buf[i] = '0';
 
-    res = run_target(argv, tmp_buf, in_len, 0);
+    res = tmin_run_target(fsrv, argv, tmp_buf, in_len, 0);
 
     if (res) {
 
@@ -772,9 +539,11 @@ next_del_blksize:
       alpha_del2++;
       changed_any = 1;
 
-    } else
+    } else {
 
       tmp_buf[i] = orig;
+
+    }
 
   }
 
@@ -783,20 +552,41 @@ next_del_blksize:
   OKF("Character minimization done, %u byte%s replaced.", alpha_del2,
       alpha_del2 == 1 ? "" : "s");
 
-  if (changed_any) goto next_pass;
+  if (changed_any) { goto next_pass; }
 
 finalize_all:
 
+  if (tmp_buf) { ck_free(tmp_buf); }
+
+  if (hang_mode) {
+
+    SAYF("\n" cGRA "     File size reduced by : " cRST
+         "%0.02f%% (to %u byte%s)\n" cGRA "    Characters simplified : " cRST
+         "%0.02f%%\n" cGRA "     Number of execs done : " cRST "%llu\n" cGRA
+         "          Fruitless execs : " cRST "termination=%u crash=%u\n\n",
+         100 - ((double)in_len) * 100 / orig_len, in_len,
+         in_len == 1 ? "" : "s",
+         ((double)(alpha_d_total)) * 100 / (in_len ? in_len : 1),
+         fsrv->total_execs, missed_paths, missed_crashes);
+    return;
+
+  }
+
   SAYF("\n" cGRA "     File size reduced by : " cRST
        "%0.02f%% (to %u byte%s)\n" cGRA "    Characters simplified : " cRST
-       "%0.02f%%\n" cGRA "     Number of execs done : " cRST "%u\n" cGRA
+       "%0.02f%%\n" cGRA "     Number of execs done : " cRST "%llu\n" cGRA
        "          Fruitless execs : " cRST "path=%u crash=%u hang=%s%u\n\n",
        100 - ((double)in_len) * 100 / orig_len, in_len, in_len == 1 ? "" : "s",
-       ((double)(alpha_d_total)) * 100 / (in_len ? in_len : 1), total_execs,
-       missed_paths, missed_crashes, missed_hangs ? cLRD : "", missed_hangs);
+       ((double)(alpha_d_total)) * 100 / (in_len ? in_len : 1),
+       fsrv->total_execs, missed_paths, missed_crashes,
+       missed_hangs ? cLRD : "", missed_hangs);
 
-  if (total_execs > 50 && missed_hangs * 10 > total_execs)
+  if (fsrv->total_execs > 50 && missed_hangs * 10 > fsrv->total_execs &&
+      !hang_mode) {
+
     WARNF(cLRD "Frequent timeouts - results may be skewed." cRST);
+
+  }
 
 }
 
@@ -805,65 +595,76 @@ finalize_all:
 static void handle_stop_sig(int sig) {
 
   stop_soon = 1;
-
-  if (child_pid > 0) kill(child_pid, SIGKILL);
+  afl_fsrv_killall();
 
 }
 
 /* Do basic preparations - persistent fds, filenames, etc. */
 
-static void set_up_environment(void) {
+static void set_up_environment(afl_forkserver_t *fsrv) {
 
-  u8* x;
+  u8 *x;
 
-  dev_null_fd = open("/dev/null", O_RDWR);
-  if (dev_null_fd < 0) PFATAL("Unable to open /dev/null");
+  fsrv->dev_null_fd = open("/dev/null", O_RDWR);
+  if (fsrv->dev_null_fd < 0) { PFATAL("Unable to open /dev/null"); }
 
   if (!out_file) {
 
-    u8* use_dir = ".";
+    u8 *use_dir = ".";
 
     if (access(use_dir, R_OK | W_OK | X_OK)) {
 
-      use_dir = getenv("TMPDIR");
-      if (!use_dir) use_dir = "/tmp";
+      use_dir = get_afl_env("TMPDIR");
+      if (!use_dir) { use_dir = "/tmp"; }
 
     }
 
-    out_file = alloc_printf("%s/.afl-tmin-temp-%u", use_dir, getpid());
+    out_file = alloc_printf("%s/.afl-tmin-temp-%u", use_dir, (u32)getpid());
 
   }
 
   unlink(out_file);
 
-  out_fd = open(out_file, O_RDWR | O_CREAT | O_EXCL, 0600);
+  fsrv->out_fd = open(out_file, O_RDWR | O_CREAT | O_EXCL, 0600);
 
-  if (out_fd < 0) PFATAL("Unable to create '%s'", out_file);
+  if (fsrv->out_fd < 0) { PFATAL("Unable to create '%s'", out_file); }
 
   /* Set sane defaults... */
 
-  x = getenv("ASAN_OPTIONS");
+  x = get_afl_env("ASAN_OPTIONS");
 
   if (x) {
 
-    if (!strstr(x, "abort_on_error=1"))
+    if (!strstr(x, "abort_on_error=1")) {
+
       FATAL("Custom ASAN_OPTIONS set without abort_on_error=1 - please fix!");
 
-    if (!strstr(x, "symbolize=0"))
+    }
+
+    if (!strstr(x, "symbolize=0")) {
+
       FATAL("Custom ASAN_OPTIONS set without symbolize=0 - please fix!");
+
+    }
 
   }
 
-  x = getenv("MSAN_OPTIONS");
+  x = get_afl_env("MSAN_OPTIONS");
 
   if (x) {
 
-    if (!strstr(x, "exit_code=" STRINGIFY(MSAN_ERROR)))
+    if (!strstr(x, "exit_code=" STRINGIFY(MSAN_ERROR))) {
+
       FATAL("Custom MSAN_OPTIONS set without exit_code=" STRINGIFY(
           MSAN_ERROR) " - please fix!");
 
-    if (!strstr(x, "symbolize=0"))
+    }
+
+    if (!strstr(x, "symbolize=0")) {
+
       FATAL("Custom MSAN_OPTIONS set without symbolize=0 - please fix!");
+
+    }
 
   }
 
@@ -880,10 +681,49 @@ static void set_up_environment(void) {
                          "allocator_may_return_null=1:"
                          "msan_track_origins=0", 0);
 
-  if (getenv("AFL_PRELOAD")) {
+  if (get_afl_env("AFL_PRELOAD")) {
 
-    setenv("LD_PRELOAD", getenv("AFL_PRELOAD"), 1);
-    setenv("DYLD_INSERT_LIBRARIES", getenv("AFL_PRELOAD"), 1);
+    if (fsrv->qemu_mode) {
+
+      u8 *qemu_preload = getenv("QEMU_SET_ENV");
+      u8 *afl_preload = getenv("AFL_PRELOAD");
+      u8 *buf;
+
+      s32 i, afl_preload_size = strlen(afl_preload);
+      for (i = 0; i < afl_preload_size; ++i) {
+
+        if (afl_preload[i] == ',') {
+
+          PFATAL(
+              "Comma (',') is not allowed in AFL_PRELOAD when -Q is "
+              "specified!");
+
+        }
+
+      }
+
+      if (qemu_preload) {
+
+        buf = alloc_printf("%s,LD_PRELOAD=%s,DYLD_INSERT_LIBRARIES=%s",
+                           qemu_preload, afl_preload, afl_preload);
+
+      } else {
+
+        buf = alloc_printf("LD_PRELOAD=%s,DYLD_INSERT_LIBRARIES=%s",
+                           afl_preload, afl_preload);
+
+      }
+
+      setenv("QEMU_SET_ENV", buf, 1);
+
+      ck_free(buf);
+
+    } else {
+
+      setenv("LD_PRELOAD", getenv("AFL_PRELOAD"), 1);
+      setenv("DYLD_INSERT_LIBRARIES", getenv("AFL_PRELOAD"), 1);
+
+    }
 
   }
 
@@ -908,26 +748,21 @@ static void setup_signal_handlers(void) {
   sigaction(SIGINT, &sa, NULL);
   sigaction(SIGTERM, &sa, NULL);
 
-  /* Exec timeout notifications. */
-
-  sa.sa_handler = handle_timeout;
-  sigaction(SIGALRM, &sa, NULL);
-
 }
 
 /* Display usage hints. */
 
-static void usage(u8* argv0) {
+static void usage(u8 *argv0) {
 
   SAYF(
       "\n%s [ options ] -- /path/to/target_app [ ... ]\n\n"
 
-      "Required parameters:\n\n"
+      "Required parameters:\n"
 
       "  -i file       - input test case to be shrunk by the tool\n"
       "  -o file       - final output location for the minimized data\n\n"
 
-      "Execution control settings:\n\n"
+      "Execution control settings:\n"
 
       "  -f file       - input file read by the tested program (stdin)\n"
       "  -t msec       - timeout for each run (%d ms)\n"
@@ -935,137 +770,93 @@ static void usage(u8* argv0) {
       "  -Q            - use binary-only instrumentation (QEMU mode)\n"
       "  -U            - use unicorn-based instrumentation (Unicorn mode)\n"
       "  -W            - use qemu-based instrumentation with Wine (Wine "
-      "mode)\n\n"
+      "mode)\n"
       "                  (Not necessary, here for consistency with other afl-* "
       "tools)\n\n"
 
-      "Minimization settings:\n\n"
+      "Minimization settings:\n"
 
       "  -e            - solve for edge coverage only, ignore hit counts\n"
       "  -x            - treat non-zero exit codes as crashes\n\n"
+      "  -H            - minimize a hang (hang mode)\n"
 
-      "For additional tips, please consult %s/README.\n\n",
+      "For additional tips, please consult %s/README.md.\n\n"
 
-      argv0, EXEC_TIMEOUT, MEM_LIMIT, doc_path);
+      "Environment variables used:\n"
+      "TMPDIR: directory to use for temporary input files\n"
+      "ASAN_OPTIONS: custom settings for ASAN\n"
+      "              (must contain abort_on_error=1 and symbolize=0)\n"
+      "MSAN_OPTIONS: custom settings for MSAN\n"
+      "              (must contain exitcode="STRINGIFY(MSAN_ERROR)" and symbolize=0)\n"
+      "AFL_MAP_SIZE: the shared memory size for that target. must be >= the size\n"
+      "              the target was compiled for\n"
+      "AFL_PRELOAD:  LD_PRELOAD / DYLD_INSERT_LIBRARIES settings for target\n"
+      "AFL_TMIN_EXACT: require execution paths to match for crashing inputs\n"
+
+      , argv0, EXEC_TIMEOUT, MEM_LIMIT, doc_path);
 
   exit(1);
 
 }
 
-/* Find binary. */
-
-static void find_binary(u8* fname) {
-
-  u8*         env_path = 0;
-  struct stat st;
-
-  if (strchr(fname, '/') || !(env_path = getenv("PATH"))) {
-
-    target_path = ck_strdup(fname);
-
-    if (stat(target_path, &st) || !S_ISREG(st.st_mode) ||
-        !(st.st_mode & 0111) || st.st_size < 4)
-      FATAL("Program '%s' not found or not executable", fname);
-
-  } else {
-
-    while (env_path) {
-
-      u8 *cur_elem, *delim = strchr(env_path, ':');
-
-      if (delim) {
-
-        cur_elem = ck_alloc(delim - env_path + 1);
-        memcpy(cur_elem, env_path, delim - env_path);
-        delim++;
-
-      } else
-
-        cur_elem = ck_strdup(env_path);
-
-      env_path = delim;
-
-      if (cur_elem[0])
-        target_path = alloc_printf("%s/%s", cur_elem, fname);
-      else
-        target_path = ck_strdup(fname);
-
-      ck_free(cur_elem);
-
-      if (!stat(target_path, &st) && S_ISREG(st.st_mode) &&
-          (st.st_mode & 0111) && st.st_size >= 4)
-        break;
-
-      ck_free(target_path);
-      target_path = 0;
-
-    }
-
-    if (!target_path) FATAL("Program '%s' not found or not executable", fname);
-
-  }
-
-}
-
-/* Read mask bitmap from file. This is for the -B option. */
-
-static void read_bitmap(u8* fname) {
-
-  s32 fd = open(fname, O_RDONLY);
-
-  if (fd < 0) PFATAL("Unable to open '%s'", fname);
-
-  ck_read(fd, mask_bitmap, MAP_SIZE, fname);
-
-  close(fd);
-
-}
-
 /* Main entry point */
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv_orig, char **envp) {
 
-  s32 opt;
-  u8  mem_limit_given = 0, timeout_given = 0, qemu_mode = 0, unicorn_mode = 0,
-     use_wine = 0;
-  char** use_argv;
+  s32    opt;
+  u8     mem_limit_given = 0, timeout_given = 0, unicorn_mode = 0, use_wine = 0;
+  char **use_argv;
+
+  char **argv = argv_cpy_dup(argc, argv_orig);
+
+  afl_forkserver_t  fsrv_var = {0};
+  afl_forkserver_t *fsrv = &fsrv_var;
+  afl_fsrv_init(fsrv);
+  map_size = get_map_size();
+  fsrv->map_size = map_size;
 
   doc_path = access(DOC_PATH, F_OK) ? "docs" : DOC_PATH;
 
   SAYF(cCYA "afl-tmin" VERSION cRST " by Michal Zalewski\n");
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:B:xeQUWh")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:B:xeQUWHh")) > 0) {
 
     switch (opt) {
 
       case 'i':
 
-        if (in_file) FATAL("Multiple -i options not supported");
+        if (in_file) { FATAL("Multiple -i options not supported"); }
         in_file = optarg;
         break;
 
       case 'o':
 
-        if (output_file) FATAL("Multiple -o options not supported");
+        if (output_file) { FATAL("Multiple -o options not supported"); }
         output_file = optarg;
         break;
 
       case 'f':
 
-        if (out_file) FATAL("Multiple -f options not supported");
-        use_stdin = 0;
-        out_file = optarg;
+        if (out_file) { FATAL("Multiple -f options not supported"); }
+        fsrv->use_stdin = 0;
+        out_file = ck_strdup(optarg);
         break;
 
       case 'e':
 
-        if (edges_only) FATAL("Multiple -e options not supported");
+        if (edges_only) { FATAL("Multiple -e options not supported"); }
+        if (hang_mode) {
+
+          FATAL("Edges only and hang mode are mutually exclusive.");
+
+        }
+
         edges_only = 1;
         break;
 
       case 'x':
 
-        if (exit_crash) FATAL("Multiple -x options not supported");
+        if (exit_crash) { FATAL("Multiple -x options not supported"); }
         exit_crash = 1;
         break;
 
@@ -1073,35 +864,51 @@ int main(int argc, char** argv) {
 
         u8 suffix = 'M';
 
-        if (mem_limit_given) FATAL("Multiple -m options not supported");
+        if (mem_limit_given) { FATAL("Multiple -m options not supported"); }
         mem_limit_given = 1;
+
+        if (!optarg) { FATAL("Wrong usage of -m"); }
 
         if (!strcmp(optarg, "none")) {
 
-          mem_limit = 0;
+          fsrv->mem_limit = 0;
           break;
 
         }
 
-        if (sscanf(optarg, "%llu%c", &mem_limit, &suffix) < 1 ||
-            optarg[0] == '-')
+        if (sscanf(optarg, "%llu%c", &fsrv->mem_limit, &suffix) < 1 ||
+            optarg[0] == '-') {
+
           FATAL("Bad syntax used for -m");
-
-        switch (suffix) {
-
-          case 'T': mem_limit *= 1024 * 1024; break;
-          case 'G': mem_limit *= 1024; break;
-          case 'k': mem_limit /= 1024; break;
-          case 'M': break;
-
-          default: FATAL("Unsupported suffix or bad syntax for -m");
 
         }
 
-        if (mem_limit < 5) FATAL("Dangerously low value of -m");
+        switch (suffix) {
 
-        if (sizeof(rlim_t) == 4 && mem_limit > 2000)
+          case 'T':
+            fsrv->mem_limit *= 1024 * 1024;
+            break;
+          case 'G':
+            fsrv->mem_limit *= 1024;
+            break;
+          case 'k':
+            fsrv->mem_limit /= 1024;
+            break;
+          case 'M':
+            break;
+
+          default:
+            FATAL("Unsupported suffix or bad syntax for -m");
+
+        }
+
+        if (fsrv->mem_limit < 5) { FATAL("Dangerously low value of -m"); }
+
+        if (sizeof(rlim_t) == 4 && fsrv->mem_limit > 2000) {
+
           FATAL("Value of -m out of range on 32-bit systems");
+
+        }
 
       }
 
@@ -1109,40 +916,59 @@ int main(int argc, char** argv) {
 
       case 't':
 
-        if (timeout_given) FATAL("Multiple -t options not supported");
+        if (timeout_given) { FATAL("Multiple -t options not supported"); }
         timeout_given = 1;
 
-        exec_tmout = atoi(optarg);
+        if (!optarg) { FATAL("Wrong usage of -t"); }
 
-        if (exec_tmout < 10 || optarg[0] == '-')
+        fsrv->exec_tmout = atoi(optarg);
+
+        if (fsrv->exec_tmout < 10 || optarg[0] == '-') {
+
           FATAL("Dangerously low value of -t");
+
+        }
 
         break;
 
       case 'Q':
 
-        if (qemu_mode) FATAL("Multiple -Q options not supported");
-        if (!mem_limit_given) mem_limit = MEM_LIMIT_QEMU;
+        if (fsrv->qemu_mode) { FATAL("Multiple -Q options not supported"); }
+        if (!mem_limit_given) { fsrv->mem_limit = MEM_LIMIT_QEMU; }
 
-        qemu_mode = 1;
+        fsrv->qemu_mode = 1;
         break;
 
       case 'U':
 
-        if (unicorn_mode) FATAL("Multiple -Q options not supported");
-        if (!mem_limit_given) mem_limit = MEM_LIMIT_UNICORN;
+        if (unicorn_mode) { FATAL("Multiple -Q options not supported"); }
+        if (!mem_limit_given) { fsrv->mem_limit = MEM_LIMIT_UNICORN; }
 
         unicorn_mode = 1;
         break;
 
       case 'W':                                           /* Wine+QEMU mode */
 
-        if (use_wine) FATAL("Multiple -W options not supported");
-        qemu_mode = 1;
+        if (use_wine) { FATAL("Multiple -W options not supported"); }
+        fsrv->qemu_mode = 1;
         use_wine = 1;
 
-        if (!mem_limit_given) mem_limit = 0;
+        if (!mem_limit_given) { fsrv->mem_limit = 0; }
 
+        break;
+
+      case 'H':                                                /* Hang Mode */
+
+        /* Minimizes a testcase to the minimum that still times out */
+
+        if (hang_mode) { FATAL("Multipe -H options not supported"); }
+        if (edges_only) {
+
+          FATAL("Edges only and hang mode are mutually exclusive.");
+
+        }
+
+        hang_mode = 1;
         break;
 
       case 'B':                                              /* load bitmap */
@@ -1160,9 +986,9 @@ int main(int argc, char** argv) {
            The option may be extended and made more official if it proves
            to be useful. */
 
-        if (mask_bitmap) FATAL("Multiple -B options not supported");
-        mask_bitmap = ck_alloc(MAP_SIZE);
-        read_bitmap(optarg);
+        if (mask_bitmap) { FATAL("Multiple -B options not supported"); }
+        mask_bitmap = ck_alloc(map_size);
+        read_bitmap(optarg, mask_bitmap, map_size);
         break;
 
       case 'h':
@@ -1170,54 +996,96 @@ int main(int argc, char** argv) {
         return -1;
         break;
 
-      default: usage(argv[0]);
+      default:
+        usage(argv[0]);
 
     }
 
-  if (optind == argc || !in_file || !output_file) usage(argv[0]);
+  }
 
-  setup_shm(0);
+  if (optind == argc || !in_file || !output_file) { usage(argv[0]); }
+
+  check_environment_vars(envp);
+
+  sharedmem_t shm = {0};
+  fsrv->trace_bits = afl_shm_init(&shm, map_size, 0);
+
   atexit(at_exit_handler);
   setup_signal_handlers();
 
-  set_up_environment();
+  set_up_environment(fsrv);
 
-  find_binary(argv[optind]);
-  detect_file_args(argv + optind, out_file);
+  fsrv->target_path = find_binary(argv[optind]);
+  detect_file_args(argv + optind, out_file, &fsrv->use_stdin);
 
-  if (qemu_mode) {
+  if (fsrv->qemu_mode) {
 
-    if (use_wine)
-      use_argv = get_wine_argv(argv[0], argv + optind, argc - optind);
-    else
-      use_argv = get_qemu_argv(argv[0], argv + optind, argc - optind);
+    if (use_wine) {
 
-  } else
+      use_argv = get_wine_argv(argv[0], &fsrv->target_path, argc - optind,
+                               argv + optind);
+
+    } else {
+
+      use_argv = get_qemu_argv(argv[0], &fsrv->target_path, argc - optind,
+                               argv + optind);
+
+    }
+
+  } else {
 
     use_argv = argv + optind;
 
-  exact_mode = !!getenv("AFL_TMIN_EXACT");
+  }
+
+  exact_mode = !!get_afl_env("AFL_TMIN_EXACT");
+
+  if (hang_mode && exact_mode) {
+
+    SAYF("AFL_TMIN_EXACT won't work for loops in hang mode, ignoring.");
+    exact_mode = 0;
+
+  }
 
   SAYF("\n");
 
   read_initial_file();
 
-  init_forkserver(use_argv);
+  afl_fsrv_start(fsrv, use_argv, &stop_soon,
+                 get_afl_env("AFL_DEBUG_CHILD_OUTPUT") ? 1 : 0);
 
   ACTF("Performing dry run (mem limit = %llu MB, timeout = %u ms%s)...",
-       mem_limit, exec_tmout, edges_only ? ", edges only" : "");
+       fsrv->mem_limit, fsrv->exec_tmout, edges_only ? ", edges only" : "");
 
-  run_target(use_argv, in_data, in_len, 1);
+  tmin_run_target(fsrv, use_argv, in_data, in_len, 1);
 
-  if (child_timed_out)
-    FATAL("Target binary times out (adjusting -t may help).");
+  if (hang_mode && !fsrv->last_run_timed_out) {
 
-  if (!crash_mode) {
+    FATAL(
+        "Target binary did not time out but hang minimization mode "
+        "(-H) was set (-t %u).",
+        fsrv->exec_tmout);
+
+  }
+
+  if (fsrv->last_run_timed_out && !hang_mode) {
+
+    FATAL(
+        "Target binary times out (adjusting -t may help). Use -H to minimize a "
+        "hang.");
+
+  }
+
+  if (hang_mode) {
+
+    OKF("Program hangs as expected, minimizing in " cCYA "hang" cRST " mode.");
+
+  } else if (!crash_mode) {
 
     OKF("Program terminates normally, minimizing in " cCYA "instrumented" cRST
         " mode.");
 
-    if (!anything_set()) FATAL("No instrumentation detected.");
+    if (!anything_set(fsrv)) { FATAL("No instrumentation detected."); }
 
   } else {
 
@@ -1227,16 +1095,25 @@ int main(int argc, char** argv) {
 
   }
 
-  minimize(use_argv);
+  minimize(fsrv, use_argv);
 
   ACTF("Writing output to '%s'...", output_file);
 
   unlink(out_file);
+  if (out_file) { ck_free(out_file); }
   out_file = NULL;
 
   close(write_to_file(output_file, in_data, in_len));
 
   OKF("We're done here. Have a nice day!\n");
+
+  afl_shm_deinit(&shm);
+  afl_fsrv_deinit(fsrv);
+  if (fsrv->target_path) { ck_free(fsrv->target_path); }
+  if (mask_bitmap) { ck_free(mask_bitmap); }
+  if (in_data) { ck_free(in_data); }
+
+  argv_cpy_free(argv);
 
   exit(0);
 

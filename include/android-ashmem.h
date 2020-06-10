@@ -4,12 +4,13 @@
 
    Originally written by Michal Zalewski
 
-   Now maintained by by Marc Heuse <mh@mh-sec.de>,
-                        Heiko Eißfeldt <heiko.eissfeldt@hexco.de> and
-                        Andrea Fioraldi <andreafioraldi@gmail.com>
+   Now maintained by Marc Heuse <mh@mh-sec.de>,
+                     Heiko Eißfeldt <heiko.eissfeldt@hexco.de>,
+                     Andrea Fioraldi <andreafioraldi@gmail.com>,
+                     Dominik Maier <mail@dmnk.co>
 
    Copyright 2016, 2017 Google Inc. All rights reserved.
-   Copyright 2019 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -25,26 +26,29 @@
 #ifndef _ANDROID_ASHMEM_H
 #define _ANDROID_ASHMEM_H
 
-#include <fcntl.h>
-#include <linux/shm.h>
-#include <linux/ashmem.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
+#ifdef __ANDROID__
 
-#if __ANDROID_API__ >= 26
-#define shmat bionic_shmat
-#define shmctl bionic_shmctl
-#define shmdt bionic_shmdt
-#define shmget bionic_shmget
-#endif
-#include <sys/shm.h>
-#undef shmat
-#undef shmctl
-#undef shmdt
-#undef shmget
-#include <stdio.h>
+  #include <fcntl.h>
+  #include <linux/shm.h>
+  #include <linux/ashmem.h>
+  #include <sys/ioctl.h>
+  #include <sys/mman.h>
 
-#define ASHMEM_DEVICE "/dev/ashmem"
+  #if __ANDROID_API__ >= 26
+    #define shmat bionic_shmat
+    #define shmctl bionic_shmctl
+    #define shmdt bionic_shmdt
+    #define shmget bionic_shmget
+  #endif
+
+  #include <sys/shm.h>
+  #undef shmat
+  #undef shmctl
+  #undef shmdt
+  #undef shmget
+  #include <stdio.h>
+
+  #define ASHMEM_DEVICE "/dev/ashmem"
 
 static inline int shmctl(int __shmid, int __cmd, struct shmid_ds *__buf) {
 
@@ -63,7 +67,8 @@ static inline int shmctl(int __shmid, int __cmd, struct shmid_ds *__buf) {
 }
 
 static inline int shmget(key_t __key, size_t __size, int __shmflg) {
-  (void) __shmflg;
+
+  (void)__shmflg;
   int  fd, ret;
   char ourkey[11];
 
@@ -86,7 +91,8 @@ error:
 }
 
 static inline void *shmat(int __shmid, const void *__shmaddr, int __shmflg) {
-  (void) __shmflg;
+
+  (void)__shmflg;
   int   size;
   void *ptr;
 
@@ -99,6 +105,8 @@ static inline void *shmat(int __shmid, const void *__shmaddr, int __shmflg) {
   return ptr;
 
 }
+
+#endif                                                       /* __ANDROID__ */
 
 #endif
 

@@ -5,7 +5,7 @@
 
    Written and maintained by Andrea Fioraldi <andreafioraldi@gmail.com>
 
-   Copyright 2019 AFLplusplus Project. All rights reserved.
+   Copyright 2019-2020 AFLplusplus Project. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -15,17 +15,20 @@
 
    This Linux-only companion library allows you to instrument strcmp(),
    memcmp(), and related functions to get compare coverage.
-   See README.compcov for more info.
+   See README.md for more info.
 
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+  #define _GNU_SOURCE
+#endif
 #include <dlfcn.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
 #include <sys/types.h>
 #include <sys/shm.h>
+#include <stdbool.h>
 
 #include "types.h"
 #include "config.h"
@@ -33,7 +36,7 @@
 #include "pmparser.h"
 
 #ifndef __linux__
-#error "Sorry, this library is Linux-specific for now!"
+  #error "Sorry, this library is Linux-specific for now!"
 #endif                                                        /* !__linux__ */
 
 /* Change this value to tune the compare coverage */
@@ -42,15 +45,15 @@
 
 static void *__compcov_code_start, *__compcov_code_end;
 
-static u8* __compcov_afl_map;
+static u8 *__compcov_afl_map;
 
 static u32 __compcov_level;
 
-static int (*__libc_strcmp)(const char*, const char*);
-static int (*__libc_strncmp)(const char*, const char*, size_t);
-static int (*__libc_strcasecmp)(const char*, const char*);
-static int (*__libc_strncasecmp)(const char*, const char*, size_t);
-static int (*__libc_memcmp)(const void*, const void*, size_t);
+static int (*__libc_strcmp)(const char *, const char *);
+static int (*__libc_strncmp)(const char *, const char *, size_t);
+static int (*__libc_strcasecmp)(const char *, const char *);
+static int (*__libc_strncasecmp)(const char *, const char *, size_t);
+static int (*__libc_memcmp)(const void *, const void *, size_t);
 
 static int debug_fd = -1;
 
@@ -62,7 +65,7 @@ static u32 __compcov_ro_cnt;
 
 /* Check an address against the list of read-only mappings. */
 
-static u8 __compcov_is_ro(const void* ptr) {
+static u8 __compcov_is_ro(const void *ptr) {
 
   u32 i;
 
@@ -73,7 +76,7 @@ static u8 __compcov_is_ro(const void* ptr) {
 
 }
 
-static size_t __strlen2(const char* s1, const char* s2, size_t max_length) {
+static size_t __strlen2(const char *s1, const char *s2, size_t max_length) {
 
   // from https://github.com/googleprojectzero/CompareCoverage
 
@@ -100,7 +103,7 @@ static void __compcov_load(void) {
 
   }
 
-  char* id_str = getenv(SHM_ENV_VAR);
+  char *id_str = getenv(SHM_ENV_VAR);
   int   shm_id;
 
   if (id_str) {
@@ -108,7 +111,7 @@ static void __compcov_load(void) {
     shm_id = atoi(id_str);
     __compcov_afl_map = shmat(shm_id, NULL, 0);
 
-    if (__compcov_afl_map == (void*)-1) exit(1);
+    if (__compcov_afl_map == (void *)-1) exit(1);
 
   } else {
 
@@ -118,16 +121,16 @@ static void __compcov_load(void) {
 
   if (getenv("AFL_INST_LIBS")) {
 
-    __compcov_code_start = (void*)0;
-    __compcov_code_end = (void*)-1;
+    __compcov_code_start = (void *)0;
+    __compcov_code_end = (void *)-1;
     return;
 
   }
 
-  char* bin_name = getenv("AFL_COMPCOV_BINNAME");
+  char *bin_name = getenv("AFL_COMPCOV_BINNAME");
 
-  procmaps_iterator* maps = pmparser_parse(-1);
-  procmaps_struct*   maps_tmp = NULL;
+  procmaps_iterator *maps = pmparser_parse(-1);
+  procmaps_struct *  maps_tmp = NULL;
 
   while ((maps_tmp = pmparser_next(maps)) != NULL) {
 
@@ -156,16 +159,16 @@ static void __compcov_load(void) {
 
 }
 
-static void __compcov_trace(u64 cur_loc, const u8* v0, const u8* v1, size_t n) {
+static void __compcov_trace(u64 cur_loc, const u8 *v0, const u8 *v1, size_t n) {
 
   size_t i;
 
   if (debug_fd != 1) {
 
     char debugbuf[4096];
-    snprintf(debugbuf, sizeof(debugbuf), "0x%llx %s %s %lu\n", cur_loc,
-             v0 == NULL ? "(null)" : (char*)v0,
-             v1 == NULL ? "(null)" : (char*)v1, n);
+    snprintf(debugbuf, sizeof(debugbuf), "0x%llx %s %s %zu\n", cur_loc,
+             v0 == NULL ? "(null)" : (char *)v0,
+             v1 == NULL ? "(null)" : (char *)v1, n);
     write(debug_fd, debugbuf, strlen(debugbuf));
 
   }
@@ -180,7 +183,7 @@ static void __compcov_trace(u64 cur_loc, const u8* v0, const u8* v1, size_t n) {
 
 /* Check an address against the list of read-only mappings. */
 
-static u8 __compcov_is_in_bound(const void* ptr) {
+static u8 __compcov_is_in_bound(const void *ptr) {
 
   return ptr >= __compcov_code_start && ptr < __compcov_code_end;
 
@@ -191,9 +194,9 @@ static u8 __compcov_is_in_bound(const void* ptr) {
 
 #undef strcmp
 
-int strcmp(const char* str1, const char* str2) {
+int strcmp(const char *str1, const char *str2) {
 
-  void* retaddr = __builtin_return_address(0);
+  void *retaddr = __builtin_return_address(0);
 
   if (__compcov_is_in_bound(retaddr) &&
       !(__compcov_level < 2 && !__compcov_is_ro(str1) &&
@@ -219,9 +222,9 @@ int strcmp(const char* str1, const char* str2) {
 
 #undef strncmp
 
-int strncmp(const char* str1, const char* str2, size_t len) {
+int strncmp(const char *str1, const char *str2, size_t len) {
 
-  void* retaddr = __builtin_return_address(0);
+  void *retaddr = __builtin_return_address(0);
 
   if (__compcov_is_in_bound(retaddr) &&
       !(__compcov_level < 2 && !__compcov_is_ro(str1) &&
@@ -248,9 +251,9 @@ int strncmp(const char* str1, const char* str2, size_t len) {
 
 #undef strcasecmp
 
-int strcasecmp(const char* str1, const char* str2) {
+int strcasecmp(const char *str1, const char *str2) {
 
-  void* retaddr = __builtin_return_address(0);
+  void *retaddr = __builtin_return_address(0);
 
   if (__compcov_is_in_bound(retaddr) &&
       !(__compcov_level < 2 && !__compcov_is_ro(str1) &&
@@ -278,9 +281,9 @@ int strcasecmp(const char* str1, const char* str2) {
 
 #undef strncasecmp
 
-int strncasecmp(const char* str1, const char* str2, size_t len) {
+int strncasecmp(const char *str1, const char *str2, size_t len) {
 
-  void* retaddr = __builtin_return_address(0);
+  void *retaddr = __builtin_return_address(0);
 
   if (__compcov_is_in_bound(retaddr) &&
       !(__compcov_level < 2 && !__compcov_is_ro(str1) &&
@@ -309,9 +312,9 @@ int strncasecmp(const char* str1, const char* str2, size_t len) {
 
 #undef memcmp
 
-int memcmp(const void* mem1, const void* mem2, size_t len) {
+int memcmp(const void *mem1, const void *mem2, size_t len) {
 
-  void* retaddr = __builtin_return_address(0);
+  void *retaddr = __builtin_return_address(0);
 
   if (__compcov_is_in_bound(retaddr) &&
       !(__compcov_level < 2 && !__compcov_is_ro(mem1) &&
@@ -332,6 +335,146 @@ int memcmp(const void* mem1, const void* mem2, size_t len) {
   }
 
   return __libc_memcmp(mem1, mem2, len);
+
+}
+
+// TODO bcmp
+
+/* Common libraries wrappers (from honggfuzz) */
+
+/*
+ * Apache's httpd wrappers
+ */
+int ap_cstr_casecmp(const char *s1, const char *s2) {
+
+  return strcasecmp(s1, s2);
+
+}
+
+int ap_cstr_casecmpn(const char *s1, const char *s2, size_t n) {
+
+  return strncasecmp(s1, s2, n);
+
+}
+
+int apr_cstr_casecmp(const char *s1, const char *s2) {
+
+  return strcasecmp(s1, s2);
+
+}
+
+int apr_cstr_casecmpn(const char *s1, const char *s2, size_t n) {
+
+  return strncasecmp(s1, s2, n);
+
+}
+
+/*
+ * *SSL wrappers
+ */
+int CRYPTO_memcmp(const void *m1, const void *m2, size_t len) {
+
+  return memcmp(m1, m2, len);
+
+}
+
+int OPENSSL_memcmp(const void *m1, const void *m2, size_t len) {
+
+  return memcmp(m1, m2, len);
+
+}
+
+int OPENSSL_strcasecmp(const char *s1, const char *s2) {
+
+  return strcasecmp(s1, s2);
+
+}
+
+int OPENSSL_strncasecmp(const char *s1, const char *s2, size_t len) {
+
+  return strncasecmp(s1, s2, len);
+
+}
+
+int32_t memcmpct(const void *s1, const void *s2, size_t len) {
+
+  return memcmp(s1, s2, len);
+
+}
+
+/*
+ * libXML wrappers
+ */
+int xmlStrncmp(const char *s1, const char *s2, int len) {
+
+  if (len <= 0) { return 0; }
+  if (s1 == s2) { return 0; }
+  if (s1 == NULL) { return -1; }
+  if (s2 == NULL) { return 1; }
+  return strncmp(s1, s2, (size_t)len);
+
+}
+
+int xmlStrcmp(const char *s1, const char *s2) {
+
+  if (s1 == s2) { return 0; }
+  if (s1 == NULL) { return -1; }
+  if (s2 == NULL) { return 1; }
+  return strcmp(s1, s2);
+
+}
+
+int xmlStrEqual(const char *s1, const char *s2) {
+
+  if (s1 == s2) { return 1; }
+  if (s1 == NULL) { return 0; }
+  if (s2 == NULL) { return 0; }
+  if (strcmp(s1, s2) == 0) { return 1; }
+  return 0;
+
+}
+
+int xmlStrcasecmp(const char *s1, const char *s2) {
+
+  if (s1 == s2) { return 0; }
+  if (s1 == NULL) { return -1; }
+  if (s2 == NULL) { return 1; }
+  return strcasecmp(s1, s2);
+
+}
+
+int xmlStrncasecmp(const char *s1, const char *s2, int len) {
+
+  if (len <= 0) { return 0; }
+  if (s1 == s2) { return 0; }
+  if (s1 == NULL) { return -1; }
+  if (s2 == NULL) { return 1; }
+  return strncasecmp(s1, s2, (size_t)len);
+
+}
+
+const char *xmlStrcasestr(const char *haystack, const char *needle) {
+
+  if (haystack == NULL) { return NULL; }
+  if (needle == NULL) { return NULL; }
+  return strcasestr(haystack, needle);
+
+}
+
+/*
+ * Samba wrappers
+ */
+int memcmp_const_time(const void *s1, const void *s2, size_t n) {
+
+  return memcmp(s1, s2, n);
+
+}
+
+bool strcsequal(const void *s1, const void *s2) {
+
+  if (s1 == s2) { return true; }
+  if (!s1 || !s2) { return false; }
+  return (strcmp(s1, s2) == 0);
 
 }
 
